@@ -177,3 +177,10 @@ datasets/
 
 wandb/
 ckpts/
+data/
+outputs/
+reports/
+*.h5
+*.npz
+*.pt
+.env.*
