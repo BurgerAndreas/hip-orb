@@ -2,8 +2,10 @@
 
 This fork adds Hessian readouts to frozen OrbMol-v2 v0.7.0.
 The Hessian graph is fully connected by default and separate from the backbone graph.
-See [HIP.md](HIP.md) for the architecture, tests, bounded pilot, and full-training gates.
+See [HIP.md](HIP.md) for details.
 The original Orb model and training documentation follows below.
+
+---
 
 <p align="center">
   <img src="./assets/logo_color_text.png" alt="Orbital Materials" width="600"/>
