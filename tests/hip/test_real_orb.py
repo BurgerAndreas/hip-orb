@@ -36,6 +36,7 @@ def test_real_batch_energy_force_and_training_invariance():
     optimizer.zero_grad()
     sum(h.square().mean() for h in batched).backward()
     optimizer.step()
+    assert all(parameter.grad is None for parameter in model.base.parameters())
     after = model.predict(graph(atoms))
     for key in ("energy", "forces"):
         torch.testing.assert_close(after[key], before[key], atol=0, rtol=0)
@@ -59,3 +60,29 @@ def test_real_batch_energy_force_and_training_invariance():
             "hip_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
         }
     )
+
+
+def test_real_coulomb_matches_upstream_derivative_without_labels():
+    from ase.build import molecule
+
+    from hip_orb.coulomb import fixed_charge_hessian
+    from hip_orb.model import HIPOrb
+
+    model = HIPOrb.pretrained(precision="float32-highest")
+    atoms = molecule("H2O")
+    atoms.info.update(charge=1, spin=2)
+    graph = model.adapter.from_ase_atoms_list([atoms], device="cuda")
+    feature = model.features(graph)
+    # Hold the model's latent charges fixed while differentiating the original kernel.
+    positions = feature.positions.double()
+    charges = feature.charges.double()
+    module = model.base.coulomb_module
+
+    def energy(x):
+        return module._direct_coulomb(charges, x, graph.node_batch_index, graph.n_node, 1).sum()
+
+    original = torch.autograd.functional.hessian(energy, positions).reshape(9, 9)
+    analytical = fixed_charge_hessian(positions, charges, feature.constant, feature.sigma)
+    torch.testing.assert_close(analytical, original, atol=1e-10, rtol=1e-10)
+    feature.nodes.requires_grad_(False)
+    assert not feature.nodes.requires_grad and not feature.charges.requires_grad

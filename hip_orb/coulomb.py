@@ -3,6 +3,34 @@
 import math
 
 import torch
+from hip_orb.block_layout import require
+
+
+def fixed_charge_blocks(positions, charges, i, j, constant=14.3996, sigma=None):
+    """Return off-diagonal and summed diagonal blocks across disjoint molecules."""
+    delta = positions[i] - positions[j]
+    r = delta.norm(dim=-1)
+    require((r > 0).all(), "Coulomb pairs must have nonzero distance")
+    if sigma is None:
+        first, second = -r.pow(-2), 2*r.pow(-3)
+    else:
+        if sigma <= 0:
+            raise ValueError("Damping sigma must be positive")
+        a = 1 / (sigma * math.sqrt(2))
+        erf = torch.erf(a*r)
+        derivative = 2*a/math.sqrt(math.pi) * torch.exp(-(a*r).square())
+        first = derivative/r - erf/r.square()
+        second = -2*a*a*derivative - 2*derivative/r.square() + 2*erf/r.pow(3)
+    unit = delta/r[:, None]
+    outer = unit[:, :, None]*unit[:, None, :]
+    eye = torch.eye(3, device=r.device, dtype=r.dtype)
+    blocks = (second-first/r)[:, None, None]*outer + (first/r)[:, None, None]*eye
+    q = charges.reshape(-1)
+    blocks = blocks*(constant*q[i]*q[j])[:, None, None]
+    diagonal = positions.new_zeros((len(positions), 3, 3))
+    diagonal.index_add_(0, i, blocks)
+    diagonal.index_add_(0, j, blocks)
+    return -blocks, diagonal
 
 
 def fixed_charge_hessian(positions, charges, constant=14.3996, sigma=None):

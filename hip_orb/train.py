@@ -13,6 +13,7 @@ from ase import Atoms
 
 from hip_orb import ORB_COMMIT, ORB_VERSION
 from hip_orb.coulomb import fixed_charge_hessian
+from hip_orb.data import unpack_hessian
 from hip_orb.metrics import hessian_metrics
 from hip_orb.model import HIPOrb
 
@@ -20,7 +21,7 @@ from hip_orb.model import HIPOrb
 def read_samples(directory, count, minimum, maximum, assignments=None):
     """Read a bounded pilot; skip incomplete shards and retain scientific IDs."""
     samples = []
-    paths = sorted(directory.glob("shard_*.h5"))
+    paths = sorted(directory.glob("shard_*.h5")) or sorted(directory.glob("*/shard_*.h5"))
     cap = count
     if assignments is not None:
         with np.load(assignments) as packed:
@@ -36,7 +37,10 @@ def read_samples(directory, count, minimum, maximum, assignments=None):
             for group in groups
             if row < len(group)
         ]
-        paths = [directory / f"shard_{index:05d}.h5" for index in ids]
+        paths = [directory / f"shard_{index:05d}.h5"
+                 if (directory / f"shard_{index:05d}.h5").exists()
+                 else directory / f"{index // 1000:03d}" / f"shard_{index:05d}.h5"
+                 for index in ids]
     for path in paths:
         if ".partial." in path.name:
             continue
@@ -56,7 +60,8 @@ def read_samples(directory, count, minimum, maximum, assignments=None):
                 samples.append(
                     (
                         atoms,
-                        f["hessian_flat"][hlo:hhi].reshape(3 * n, 3 * n),
+                        unpack_hessian(torch.from_numpy(f["hessian_upper"][hlo:hhi]), int(n)).numpy()
+                        if "hessian_upper" in f else f["hessian_flat"][hlo:hhi].reshape(3 * n, 3 * n),
                         int(f["omol_index"][row]),
                     )
                 )
@@ -230,10 +235,9 @@ def main():
         if args.device.startswith("cuda")
         else None,
         "molecule_disjoint_split_verified": False,
-        "prfo_passed": False,
         "overfit_passed": overfit_passed,
         "full_training_allowed": False,
-        "gate_notes": "Provisional geometry split. Require molecular identity and real TS tests before full training.",
+        "gate_notes": "Provisional geometry split. Verify molecular identity before full training.",
     }
     (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"validation": average, "full_training_allowed": False}), flush=True)

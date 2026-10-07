@@ -30,6 +30,12 @@ Install with `uv sync --extra hip`. Run unit tests with `pytest tests/hip/test_h
 GPU integration tests load the real checkpoint and compare the original predictions.
 Set `HIP_ORB_REAL_TESTS=1` to enable them.
 
+Start with `scripts/hip_preflight.sbatch`. It uses generated molecules and synthetic tensors only.
+It cannot start dataset training. Tests cover generated sizes through 350 atoms.
+The synthetic optimizer step checks gradients and freeze behavior, not model accuracy.
+The source tag retains stale version metadata; this fork reports `0.7.0+hip.0`.
+This metadata correction does not change original model operations or parameters.
+
 Run `hip-orb-train --help` for the overfit and pilot commands.
 The runner reads completed OrbMol HDF5 shards. It records sample indices, not file locations.
 It verifies that every original model parameter and buffer stays unchanged.
@@ -48,12 +54,9 @@ Require all of these checks before adding or launching it:
 - Successful real-molecule overfit and unchanged original predictions.
 - A verified molecule-disjoint training/validation split.
 - Acceptable held-out curvature and low-mode metrics, including rotation checks.
-- Real transition-state P-RFO comparisons using the same energy/force model.
 - Measured full-model speed improvement against collection autograd Hessians.
 - Measured peak memory across the intended atom-count range, through 350 atoms.
 
-The small P-RFO implementation is a controlled comparison tool, not a production optimizer.
-Its synthetic saddle test does not establish molecular transition-state performance.
 No pilot result alone can silently enable full training.
 
 After the pilot, `python -m hip_orb.benchmark` checks 20, 50, 70, 110, 200, and 350 atoms.
