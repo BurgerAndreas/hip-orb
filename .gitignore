@@ -184,3 +184,10 @@ reports/
 *.npz
 *.pt
 .env.*
+!.env.example
+logs/
+slurm-*.out
+train_*.out
+train_*.err
+compile_audit_*.out
+compile_audit_*.err
