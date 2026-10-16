@@ -68,7 +68,7 @@ Training targets remain unchanged. This option does not remove rotational modes.
 Enforce matrix symmetry during assembly. An off-diagonal block can be nonsymmetric.
 Add analytical, fixed-charge Coulomb curvature for every atom pair.
 Support the original optional erf damping. Reject periodic systems for now.
-Use the checkpoint's Coulomb constant, not a fitted replacement.
+Use the checkpoint's Coulomb constant.
 
 Train on `teacher Hessian - fixed-charge Coulomb Hessian`.
 The residual includes charge response, repulsion, and short-range curvature.
@@ -137,9 +137,9 @@ Both configurations use the same training and separate validation indexes.
 The pilot selects 50-atom shards through configuration. Long training selects 2–350 atoms.
 The Hessian element budget reduces batch sizes for larger molecules. Shard tails can produce smaller batches.
 The runner reloads the saved checkpoint to check that it can read it.
-The runner reads completed OrbMol HDF5 shards. It records sample indices, not file locations.
+The runner reads OrbMol HDF5 shards. It records sample indices.
 It verifies that every original model parameter and buffer stays unchanged.
-Validation metrics include mass-weighted vibrational Hessians, eigenvalues, and low-mode subspace overlap.
+Validation metrics include mass-weighted vibrational Hessians, eigenvalues, low-mode subspace overlap, and rotation error.
 `first_mode_abs_cosine` reports mean absolute cosine after mass weighting and removal of rigid translation and rotation.
 `first_mode_abs_cosine_rms` reports the square root of mean squared cosine (`first_mode_overlap`).
 These two averages differ; the RMS value does not equal mean absolute cosine.
@@ -175,7 +175,7 @@ Supply `--train-index` and `--validation-index` for the packed collections.
 The runner never splits training geometries to create validation data.
 
 Supply scheduler settings through your submission command.
-Set cache and data paths in an ignored `.env`. Never publish runtime logs or local settings.
+Set cache and data paths in an ignored `.env`.
 Set `HIP_TRAIN_INDEX` and `HIP_VALIDATION_INDEX` for the separate collections.
 Copy `.env.example` to `.env` and replace its private path and scheduler placeholders.
 The example contains no credentials. Keep tokens in `.env` or an exported environment variable.
@@ -186,22 +186,9 @@ Continuation jobs use the same helper and exported run settings.
 Select other loss configurations with `HIP_TRAIN_CONFIG`; give each run a separate `HIP_TRAIN_OUTPUT`.
 Override `HIP_SLURM_PARTITION` for CPU-only preparation jobs.
 
-## Full-training gate
-
-The streaming runner supports long runs. Do not launch full training before these checks pass:
-
-- Successful real-molecule overfit and unchanged original predictions.
-- A verified molecule-disjoint training/validation split.
-- Acceptable held-out curvature and low-mode metrics, including rotation checks.
-- Measured full-model speed improvement against collection autograd Hessians.
-- Measured peak memory across the intended atom-count range, through 350 atoms.
-
-No pilot result alone can silently enable full training.
-
-After the pilot, `python -m hip_orb.benchmark` checks 20, 50, 70, 110, 200, and 350 atoms.
+`python -m hip_orb.benchmark` checks latency on molecules with 20, 50, 70, 110, 200, and 350 atoms.
 It includes graph construction and frozen backbone inference in HIP timing.
-The reference uses the collection's angular adapter and eight-row batched VJPs.
-This measures single-molecule latency, not optimal multi-molecule throughput.
+The autograd Hessian reference uses the collection's angular adapter and eight-row batched VJPs.
 
 ## Training execution
 
