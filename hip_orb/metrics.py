@@ -1,4 +1,4 @@
-"""Hessian and vibrational-space metrics for pilot evaluation."""
+"""Hessian and vibrational-space metrics for training validation."""
 
 import torch
 
@@ -43,6 +43,7 @@ def hessian_metrics(predicted, target, positions, masses):
     output.update(
         vibrational_mae=float((p - t).abs().mean()),
         eigenvalue_mae=float((pe - te).abs().mean()),
+        first_mode_abs_cosine=float((pv[:, 0] @ tv[:, 0]).abs()),
         first_mode_overlap=float((pv[:, 0] @ tv[:, 0]).square()),
         low_subspace_overlap=float((pv[:, :k].T @ tv[:, :k]).square().sum() / k),
         negative_modes_predicted=int((pe < -1e-6).sum()),

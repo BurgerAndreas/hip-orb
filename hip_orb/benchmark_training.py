@@ -3,6 +3,7 @@ import argparse
 import copy
 import gc
 import hashlib
+import math
 import json
 from pathlib import Path
 import time
@@ -11,12 +12,16 @@ import shutil
 
 import numpy as np
 import torch
+from ase.data import atomic_masses
 
 from hip_orb.data import OrbMolDataset, make_loader, unpack_hessian
 from hip_orb.block_layout import require, layout
 from hip_orb.model import HIPOrb
+from hip_orb.losses import LOSS_TYPES, hessian_error_loss, rotate_hessian, rotation_consistency_loss
 from hip_orb.preparation import PreparedCollator, prepare_batch
 from hip_orb.graphs import canonical_message_graph, refresh_message_vectors, deterministic_graph_audit
+
+ATOMIC_MASSES = torch.from_numpy(atomic_masses.copy())
 
 
 def model_hash(model):
@@ -27,15 +32,31 @@ def model_hash(model):
     return digest.hexdigest()
 
 
-def training_step(model, optimizer, batch, device="cuda", *, host_sizes=True):
+def training_step(model, optimizer, batch, device="cuda", *, host_sizes=True, loss_type="mse",
+                  consistency_weight=0.0, consistency_seed=1, translation_scale=0.0,
+                  return_components=False, rotation_sampling="uniform", reference_views=None):
     """Include rotations, ASE graphs, transfer, frozen features, and head update."""
+    if loss_type not in LOSS_TYPES:
+        raise ValueError(f"Hessian loss must be one of {LOSS_TYPES}")
+    if not math.isfinite(consistency_weight) or consistency_weight < 0:
+        raise ValueError("Consistency weight must be finite and nonnegative")
+    reference_views = (2 if consistency_weight else 1) if reference_views is None else reference_views
+    if reference_views not in (1, 2) or (consistency_weight and reference_views != 2):
+        raise ValueError("Rotation consistency requires two reference views; views must be 1 or 2")
     with torch.profiler.record_function("hip_cpu_prepare"):
         if "rotation" not in batch:
-            batch = prepare_batch(batch)
+            batch = prepare_batch(batch, translation_scale=translation_scale,
+                                  rotation_sampling=rotation_sampling,
+                                  include_molecules=not getattr(model, "_tensor_graph", False))
     rotation = batch["rotation"]
     with torch.profiler.record_function("hip_graph_build_or_transfer"):
-        graph = (batch["prepared_graph"].to(device) if "prepared_graph" in batch else
-                 model.adapter.from_ase_atoms_list(batch["molecules"], device=device))
+        if "prepared_graph" in batch:
+            graph = batch["prepared_graph"].to(device)
+        elif getattr(model, "_tensor_graph", False) and "rotated_coords" in batch:
+            from hip_orb.tensor_graph import molecular_training_graph
+            graph = molecular_training_graph(batch, model.adapter, device)
+        else:
+            graph = model.adapter.from_ase_atoms_list(batch["molecules"], device=device)
         if isinstance(model, HIPOrb):
             if "prepared_graph" not in batch:
                 graph = canonical_message_graph(graph)
@@ -56,14 +77,42 @@ def training_step(model, optimizer, batch, device="cuda", *, host_sizes=True):
         target = target.reshape(-1, 3 * n, 3 * n)
     # The head includes analytical fixed-charge Coulomb curvature exactly once.
     with torch.profiler.record_function("hip_hessian_head_coulomb_loss"):
-        predicted = torch.stack(model.head(feature))
-        loss = (predicted - target).square().mean()
+        predicted = (model.head(feature, as_tensor=True) if getattr(model.head, "_tensor_training", False)
+                     else torch.stack(model.head(feature)))
+        error = predicted - target
+        masses = (ATOMIC_MASSES[batch["atomic_numbers"].long()]
+                  if loss_type == "mass_weighted_mse" else None)
+        loss = hessian_error_loss(error, loss_type, masses=masses)
+    reference_loss = loss
+    consistency = loss.new_zeros(())
+    if reference_views == 2:
+        # The batch retains original coordinates and targets after preparation.
+        second = prepare_batch(batch, seed=consistency_seed, translation_scale=translation_scale,
+                               rotation_sampling=rotation_sampling)
+        with torch.profiler.record_function("hip_consistency_second_graph_and_backbone"):
+            second_graph = model.adapter.from_ase_atoms_list(second["molecules"], device=device)
+            if isinstance(model, HIPOrb):
+                second_graph = refresh_message_vectors(canonical_message_graph(second_graph))
+                second_feature = model.features(second_graph, sizes=sizes if host_sizes else None)
+            else:
+                second_feature = model.features(second_graph)
+        with torch.profiler.record_function("hip_consistency_head_and_loss"):
+            second_prediction = torch.stack(model.head(second_feature))
+            second_target = rotate_hessian(unpack_hessian(upper, n), second["rotation"])
+            reference_loss = (reference_loss + hessian_error_loss(
+                second_prediction - second_target, loss_type, masses)) * 0.5
+            consistency = rotation_consistency_loss(predicted, second_prediction,
+                rotation, second["rotation"], loss_type, masses)
+            loss = reference_loss + consistency_weight * consistency
     require(torch.isfinite(loss), "Training loss is not finite")
     with torch.profiler.record_function("hip_backward_and_optimizer"):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.head.parameters(), 10.0)
         optimizer.step()
+    if return_components:
+        return {"total": loss.detach(), "reference": reference_loss.detach(),
+                "consistency": consistency.detach()}
     return loss.detach()
 
 

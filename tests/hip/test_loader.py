@@ -88,9 +88,8 @@ def test_zstd_and_memory_mapped_cache_match_source(tmp_path):
     source.close()
 
 
-def test_bounded_pilot_reads_packed_nested_shards(tmp_path):
-    from hip_orb.train import read_samples
-    from pathlib import Path
+def test_benchmark_reads_packed_nested_shards(tmp_path):
+    from hip_orb.benchmark import read_samples
     index = fixture(tmp_path)
     nested = tmp_path / "000"
     nested.mkdir()
@@ -143,3 +142,54 @@ def test_benchmark_stratification_covers_all_sizes(tmp_path):
     assert [batch["coords"].shape[1] for batch in batches[:len(expected_sizes)]] == expected_sizes
     assert sorted(index for batch in batches for index in batch["omol_index"].tolist()) == list(range(15))
     dataset.close()
+
+
+def test_geometry_limit_is_exact_with_variable_batches(tmp_path):
+    dataset = OrbMolDataset(fixture(tmp_path), training_only=True)
+    # The memory budget yields batches of three for N=2 and two for N=3.
+    loader = make_loader(dataset, batch_size=256, max_hessian_elements=162,
+                         max_samples=8, pin_memory=False)
+    first = list(loader)
+    assert sum(len(batch["omol_index"]) for batch in first) == 8
+    assert len({i for batch in first for i in batch["omol_index"].tolist()}) == 8
+    assert [batch["omol_index"].tolist() for batch in loader] == [
+        batch["omol_index"].tolist() for batch in first]
+    # A smaller dataset must exhaust cleanly without repeated samples.
+    loader = make_loader(dataset, batch_size=256, max_samples=10000, pin_memory=False)
+    assert sum(len(batch["omol_index"]) for batch in loader) == 15
+    dataset.close()
+
+
+def test_resume_skips_processed_batches_only_in_first_epoch(tmp_path):
+    dataset = OrbMolDataset(fixture(tmp_path), training_only=True)
+    original = make_loader(dataset, batch_size=2, pin_memory=False)
+    resumed = make_loader(dataset, batch_size=2, start_batch=3, pin_memory=False)
+    original.batch_sampler.set_epoch(4)
+    resumed.batch_sampler.set_epoch(4)
+    assert list(resumed.batch_sampler) == list(original.batch_sampler)[3:]
+    original.batch_sampler.set_epoch(5)
+    resumed.batch_sampler.set_epoch(5)
+    assert list(resumed.batch_sampler) == list(original.batch_sampler)
+    dataset.close()
+
+
+def test_bulk_rows_match_individual_reads_with_duplicates(tmp_path):
+    import pytest
+
+    index = fixture(tmp_path)
+    ids = [14, 0, 7, 2, 0, 9, 12, 11, 13]
+    for training_only in (False, True):
+        for mode in ("none", "chunks", "arrays"):
+            data = OrbMolDataset(index,cache_mode=mode,cache_bytes=100000,training_only=training_only,max_open=1)
+            expected=[data[i] for i in ids]
+            actual=data.__getitems__(ids)
+            for left,right in zip(actual,expected,strict=True):
+                assert left.keys()==right.keys()
+                for key in left:
+                    np.testing.assert_array_equal(left[key],right[key])
+            assert data.__getitems__([])==[]
+            with pytest.raises(IndexError):data.__getitems__([-1])
+            with pytest.raises(IndexError):data.__getitems__([len(data)])
+            actual[1]['coords'][0,0]=123
+            assert data[0]['coords'][0,0]==0
+            data.close()

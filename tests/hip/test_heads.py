@@ -122,10 +122,39 @@ def test_full_graph_symmetry_gradients_and_cutoff():
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters())
 
 
-def test_batch_and_permutation():
+def test_independent_bessel_radial_features_are_finite_and_cut_off_smoothly():
+    features = sample(n=3)
+    head = HessianHead(4, 12, radial_features="bessel", radial_cutoff=4.0,
+                       radial_bases=8)
+    distance = torch.tensor([1.0, 3.999, 4.0, 5.0])
+    radial = head.radial_embedding(distance)
+    assert radial.shape == (4, 8)
+    assert torch.isfinite(radial).all()
+    assert radial[2:].count_nonzero() == 0
+    h = head(features, residual_only=True)[0]
+    assert h.shape == (9, 9) and torch.isfinite(h).all()
+    h.square().mean().backward()
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+               for parameter in head.parameters())
+    batched = Features(
+        torch.cat((features.nodes, features.nodes)), torch.cat((features.edges, features.edges)),
+        torch.cat((features.senders, features.senders + 3)),
+        torch.cat((features.receivers, features.receivers + 3)),
+        torch.cat((features.positions, features.positions)),
+        torch.cat((features.charges, features.charges)), torch.tensor([3, 3]),
+    )
+    head.zero_grad(set_to_none=True)
+    batch_h = head(batched, residual_only=True)
+    torch.testing.assert_close(batch_h[0], head(features, residual_only=True)[0])
+    torch.testing.assert_close(batch_h[1], head(features, residual_only=True)[0])
+
+
+@pytest.mark.parametrize("context", [False, True])
+def test_batch_and_permutation(context):
     torch.manual_seed(3)
     f = sample()
-    head = HessianHead(4, 12)
+    head = HessianHead(4, 12, radial_features="bessel" if context else "log",
+                       pair_residual_layers=2 if context else 0, neighbor_pooling=context)
     expected = head(f)[0]
     batched = Features(
         torch.cat([f.nodes, f.nodes]),
@@ -151,6 +180,154 @@ def test_batch_and_permutation():
     )
     cart = (perm[:, None] * 3 + torch.arange(3)).reshape(-1)
     torch.testing.assert_close(head(reordered)[0], expected[cart][:, cart])
+
+
+def test_context_diagonal_uses_neighbors_and_all_heads_receive_gradients():
+    from dataclasses import replace
+    torch.manual_seed(23)
+    features = sample()
+    head = HessianHead(4, 12, radial_features="bessel", pair_residual_layers=2,
+                       neighbor_pooling=True)
+    initial = head(features, residual_only=True)[0]
+    positions = features.positions.clone()
+    positions[1] += torch.tensor([1.0, 0.0, 0.0])
+    changed = head(replace(features, positions=positions), residual_only=True)[0]
+    assert not torch.allclose(initial[:3, :3], changed[:3, :3])
+    torch.testing.assert_close(initial, initial.T)
+    initial.square().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters())
+    singleton = Features(features.nodes[:1], features.edges[:0], features.senders[:0],
+                         features.receivers[:0], features.positions[:1], features.charges[:1],
+                         torch.tensor([1]))
+    assert torch.isfinite(head(singleton, residual_only=True)[0]).all()
+
+
+@pytest.mark.parametrize("rounds,internal", [(2, 256), (1, 1024)])
+def test_context_capacity_variants_preserve_feature_width_and_checkpoint(tmp_path, rounds, internal):
+    from dataclasses import replace
+    torch.manual_seed(37)
+    f = sample()
+    head = HessianHead(4, 256, radial_features="bessel", pair_residual_layers=2,
+                       neighbor_pooling=True, context_rounds=rounds, mlp_hidden=internal)
+    assert head.pair_adapter[0].out_features == internal
+    assert head.pair_adapter[-1].out_features == 256
+    assert head.pair_residual[0].update[0].out_features == internal
+    assert head.pair_update[-1].out_features == 256
+    predicted = head(f, residual_only=True)[0]
+    torch.testing.assert_close(predicted, predicted.T)
+    predicted.square().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in head.parameters())
+    perm = torch.tensor([2, 0, 1]); inverse = torch.argsort(perm)
+    reordered = replace(f, nodes=f.nodes[perm], charges=f.charges[perm], positions=f.positions[perm],
+                        senders=inverse[f.senders], receivers=inverse[f.receivers])
+    cart = (perm[:, None] * 3 + torch.arange(3)).flatten()
+    torch.testing.assert_close(head(reordered, residual_only=True)[0], predicted[cart][:, cart])
+    batched = Features(torch.cat((f.nodes, f.nodes)), torch.cat((f.edges, f.edges)),
+        torch.cat((f.senders, f.senders + 3)), torch.cat((f.receivers, f.receivers + 3)),
+        torch.cat((f.positions, f.positions)), torch.cat((f.charges, f.charges)), torch.tensor([3, 3]))
+    for value in head(batched, residual_only=True):
+        torch.testing.assert_close(value, predicted)
+    checkpoint = tmp_path / "head.pt"
+    torch.save({"head": head.state_dict(), "head_config": head.config}, checkpoint)
+    saved = torch.load(checkpoint, weights_only=True)
+    restored = HessianHead(**saved["head_config"])
+    restored.load_state_dict(saved["head"])
+    torch.testing.assert_close(restored(f, residual_only=True)[0], predicted)
+
+
+def test_second_context_round_uses_refined_pairs_to_update_diagonals():
+    torch.manual_seed(39)
+    f = sample()
+    one = HessianHead(4, 8, radial_features="bessel", neighbor_pooling=True)
+    torch.manual_seed(39)
+    two = HessianHead(4, 8, radial_features="bessel", neighbor_pooling=True, context_rounds=2)
+    two.load_state_dict(one.state_dict(), strict=False)
+    before_one, before_two = one(f, residual_only=True)[0], two(f, residual_only=True)[0]
+    with torch.no_grad():
+        one.pair_update[-1].bias.add_(1.0)
+        two.pair_update[-1].bias.add_(1.0)
+    # First-round diagonals precede pair refinement; second-round diagonals use its output.
+    torch.testing.assert_close(one(f, residual_only=True)[0][:3, :3], before_one[:3, :3])
+    assert not torch.allclose(two(f, residual_only=True)[0][:3, :3], before_two[:3, :3])
+
+
+@pytest.mark.parametrize("conditioned", [False, True])
+def test_extra_orb_round_uses_original_graph_and_trains_only_the_extension(conditioned):
+    from orb_models.common.models.gns import AttentionInteractionNetwork
+    from orb_models.common.models.nn_util import get_cutoff
+    from copy import deepcopy
+
+    class Conditioner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = nn.Parameter(torch.randn(4))
+
+        def forward(self, graph):
+            return graph.node_features["latent"] * 0 + self.bias, graph.edge_features["latent"] * 0 + self.bias
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gnn_stacks = nn.ModuleList([AttentionInteractionNetwork(
+                4, 2, 8, distance_cutoff=True, attention_gate="sigmoid",
+                conditioning=("additive", "additive") if conditioned else "none")])
+            self.conditioner = Conditioner() if conditioned else None
+
+        def forward(self, graph):
+            cond = self.conditioner(graph) if self.conditioner else (None, None)
+            nodes, edges = self.gnn_stacks[0](graph.node_features["latent"], graph.edge_features["latent"],
+                graph.senders, graph.receivers, get_cutoff(graph.edge_features["vectors"].norm(dim=-1)),
+                cond_nodes=cond[0], cond_edges=cond[1])
+            return {"node_features": nodes, "edge_features": edges}
+
+    class Charges(nn.Module):
+        def forward(self, nodes, graph):
+            return nodes[:, 0]
+
+    base = nn.Module()
+    base.model = Backbone()
+    base.heads = nn.ModuleDict({"latent_charges": Charges()})
+    base.coulomb_module = SimpleNamespace(coulomb_constant=14.3996, direct_coulomb_erf_damping_sigma=None)
+    graph = SimpleNamespace(system_features={"pbc": torch.tensor([False])},
+        node_features={"positions": torch.randn(3, 3), "latent": torch.randn(3, 4)},
+        edge_features={"vectors": torch.tensor([[1., 0, 0], [-1., 0, 0]]), "latent": torch.randn(2, 4)},
+        senders=torch.tensor([0, 1]), receivers=torch.tensor([1, 0]), n_node=torch.tensor([3]))
+    model = HIPOrb(base, None, hidden=12, radial_features="bessel",
+                   pair_residual_layers=2, neighbor_pooling=True, extra_orb_round=True)
+    layer = model.head.orb_message_layer
+    for original, extra in zip(base.model.gnn_stacks[-1].parameters(), layer.parameters()):
+        torch.testing.assert_close(original, extra)
+        assert original.data_ptr() != extra.data_ptr()
+    before = deepcopy(base.state_dict())
+    with torch.no_grad():
+        frozen = base.model(graph)
+        cond = base.model.conditioner(graph) if conditioned else (None, None)
+        expected = layer(frozen["node_features"], frozen["edge_features"], graph.senders, graph.receivers,
+                         get_cutoff(graph.edge_features["vectors"].norm(dim=-1)),
+                         cond_nodes=cond[0], cond_edges=cond[1])
+    captured = []
+    hook = layer.register_forward_pre_hook(lambda module, inputs: captured.append(inputs))
+    features = model.features(graph)
+    hook.remove()
+    assert captured[0][2] is graph.senders and captured[0][3] is graph.receivers
+    torch.testing.assert_close(features.nodes, expected[0])
+    torch.testing.assert_close(features.edges, expected[1])
+    torch.testing.assert_close(features.charges, frozen["node_features"][:, 0])
+    assert features.nodes.requires_grad and features.edges.requires_grad
+    optimizer = torch.optim.AdamW(model.head.parameters(), lr=1e-3)
+    model.train()
+    optimizer.zero_grad()
+    model(graph)[0].square().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in layer.parameters())
+    assert all(p.grad is None for p in base.parameters())
+    optimizer.step()
+    assert any(not torch.equal(a, b) for a, b in zip(base.model.gnn_stacks[-1].parameters(), layer.parameters()))
+    for key, value in before.items():
+        torch.testing.assert_close(base.state_dict()[key], value, atol=0, rtol=0)
+    restored = HIPOrb(deepcopy(base), None, hidden=12, radial_features="bessel",
+                      pair_residual_layers=2, neighbor_pooling=True, extra_orb_round=True)
+    restored.head.load_state_dict(model.head.state_dict())
+    torch.testing.assert_close(restored(graph)[0], model(graph)[0])
 
 
 def test_frozen_wrapper_preserves_energy_force_and_graph():
@@ -260,4 +437,4 @@ def test_head_input_gradcheck():
 def test_pinned_version_metadata():
     from orb_models import __version__
 
-    assert __version__.split("+")[0] == "0.7.0"
+    assert __version__.split("+")[0].lstrip("v") == "0.7.0"

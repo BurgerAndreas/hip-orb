@@ -6,15 +6,9 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=40G
-#SBATCH --output=outputs/preflight_%j.log
-#SBATCH --error=outputs/preflight_%j.err
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
-if [[ -f .env ]]; then
-  set -a
-  source .env
-  set +a
-fi
+source "$PWD/scripts/load_env.sh"
 : "${HIP_PYTHON:?Set a Python interpreter with Orb dependencies}"
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export HIP_ORB_REAL_TESTS=1

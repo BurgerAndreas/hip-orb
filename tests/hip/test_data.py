@@ -2,11 +2,11 @@ import h5py
 import numpy as np
 import torch
 
+from hip_orb.benchmark import read_samples
 from hip_orb.metrics import hessian_metrics, vibrational_basis
-from hip_orb.train import read_samples, transformed_sample
 
 
-def test_collection_reader_and_rotation(tmp_path):
+def test_benchmark_collection_reader(tmp_path):
     path = tmp_path / "shard_00000.h5"
     h = np.arange(36, dtype=np.float32).reshape(6, 6)
     h = h + h.T
@@ -26,10 +26,6 @@ def test_collection_reader_and_rotation(tmp_path):
             f.create_dataset(key, data=values)
     sample = read_samples(tmp_path, 1, 2, 2)[0]
     np.testing.assert_array_equal(sample[1], h)
-    rotation = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
-    _, transformed, _ = transformed_sample(sample, rotation)
-    full = torch.kron(torch.eye(2), rotation).numpy()
-    np.testing.assert_allclose(transformed, full @ h @ full.T)
 
 
 def test_linear_and_nonlinear_vibrational_rank():

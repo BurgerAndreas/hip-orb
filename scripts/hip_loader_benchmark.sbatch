@@ -5,10 +5,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --output=logs/hip_loader_%j.out
-#SBATCH --error=logs/hip_loader_%j.err
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
+source "$PWD/scripts/load_env.sh"
 : "${HIP_LOADER_PYTHON:?Set an existing Python environment}"
 : "${HIP_LOADER_PACKAGE:?Set the HIP package folder}"
 : "${HIP_LOADER_UV:?Set an installed uv executable}"
@@ -24,4 +23,4 @@ export OPENBLAS_NUM_THREADS=1
 "$HIP_LOADER_PYTHON" -m hip_orb.benchmark_data \
   --source "$HIP_LOADER_SOURCE" --assignments "$HIP_LOADER_ASSIGNMENTS" \
   --cache "$HIP_LOADER_CACHE" --report "$HIP_LOADER_REPORT" \
-  --mmap-local "${SLURM_TMPDIR:-${TMPDIR:-/tmp}}"
+  --mmap-local "${HIP_LOCAL_CACHE_PARENT:?Set the private local cache path}"

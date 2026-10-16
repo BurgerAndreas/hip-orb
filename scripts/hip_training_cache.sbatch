@@ -5,10 +5,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --output=logs/hip_step_cache_%j.out
-#SBATCH --error=logs/hip_step_cache_%j.err
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
+source "$PWD/scripts/load_env.sh"
 export PYTHONPATH="$HIP_LOADER_EXTRAS:$HIP_LOADER_PACKAGE${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1

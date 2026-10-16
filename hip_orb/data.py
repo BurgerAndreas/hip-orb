@@ -144,15 +144,40 @@ class OrbMolDataset(Dataset):
         return sample
 
     def __getitems__(self, indices):
+        if any(index < 0 or index >= len(self) for index in indices):
+            raise IndexError("Sample index outside dataset")
         # Group accesses by shard, even when a random batch spans many files.
         groups = {}
         for position, index in enumerate(indices):
             shard = int(np.searchsorted(self.ptr, index, side="right") - 1)
             groups.setdefault(shard, []).append((position, index))
         result = [None] * len(indices)
-        for group in groups.values():
-            for position, index in group:
-                result[position] = self[index]
+        for shard, group in groups.items():
+            n = int(self.natoms[shard])
+            width = 3 * n * (3 * n + 1) // 2
+            rows = np.asarray([index - self.ptr[shard] for _, index in group])
+            payload = self._payload(shard)
+            fields = {}
+            for key, values in payload.items():
+                block = n if key in ("atomic_numbers", "coords", "forces") else width if key == "hessian_upper" else 1
+                if isinstance(values, np.ndarray):
+                    selected = values.reshape(-1, block, *values.shape[1:])[rows]
+                else:
+                    selected = np.empty((len(rows), block, *values.shape[1:]), dtype=values.dtype)
+                    unique, inverse = np.unique(rows, return_inverse=True)
+                    # Read each consecutive row span once. Preserve duplicates and input order.
+                    cuts = np.r_[0, np.flatnonzero(np.diff(unique) != 1) + 1, len(unique)]
+                    for a, b in zip(cuts[:-1], cuts[1:], strict=True):
+                        lo, hi = int(unique[a]), int(unique[b - 1]) + 1
+                        chunk = np.asarray(values[lo * block:hi * block]).reshape(hi - lo, block, *values.shape[1:])
+                        mask = (inverse >= a) & (inverse < b)
+                        selected[mask] = chunk[rows[mask] - lo]
+                fields[key] = selected if block != 1 or key in ("atomic_numbers", "coords", "forces", "hessian_upper") else selected[:, 0]
+            for j, (position, _) in enumerate(group):
+                result[position] = {key: value[j] for key, value in fields.items()}
+                result[position]["source_dataset"] = self.sources[shard]
+            if self.cache_mode == "none":
+                self.close()
         return result
 
 
@@ -214,6 +239,42 @@ class LimitedBatches:
         return islice(iter(self.sampler), self.count)
 
 
+class LimitedSamples:
+    """Cap geometries exactly, including a partial final batch."""
+    def __init__(self, sampler, count):
+        if count < 1:
+            raise ValueError("Sample limit must be positive")
+        self.sampler, self.count = sampler, count
+
+    def set_epoch(self, epoch):
+        self.sampler.set_epoch(epoch)
+
+    def __iter__(self):
+        remaining = self.count
+        for batch in self.sampler:
+            selected = batch[:remaining]
+            yield selected
+            remaining -= len(selected)
+            if remaining == 0:
+                break
+
+
+class SkipBatches:
+    """Resume at a batch boundary without reading earlier geometries."""
+    def __init__(self, sampler, count):
+        self.sampler, self.count, self.first_epoch = sampler, count, None
+
+    def set_epoch(self, epoch):
+        if self.first_epoch is None:
+            self.first_epoch = epoch
+        elif epoch != self.first_epoch:
+            self.count = 0
+        self.sampler.set_epoch(epoch)
+
+    def __iter__(self):
+        return islice(iter(self.sampler), self.count, None)
+
+
 class StratifiedBatches:
     """Benchmark-only equal-N round robin; not a dataset-weighted epoch."""
     def __init__(self, sampler):
@@ -238,17 +299,34 @@ class StratifiedBatches:
 
 def make_loader(dataset, *, workers=0, order="shard", seed=7, pin_memory=True,
                 batch_size=32, max_hessian_elements=2_000_000, rank=0, world_size=1,
-                max_batches=None, collate_fn=collate_samples, stratified=False):
-    sampler = AtomBatchSampler(dataset, order=order, seed=seed, batch_size=batch_size,
-                               max_hessian_elements=max_hessian_elements, rank=rank, world_size=world_size)
+                max_batches=None, max_samples=None, start_batch=0,
+                collate_fn=collate_samples, stratified=False, batch_sampler=None,
+                prefetch_factor=2):
+    if prefetch_factor < 1:
+        raise ValueError("Prefetch factor must be positive")
+    if batch_sampler is not None:
+        if rank != 0 or world_size != 1 or stratified:
+            raise ValueError("Custom batch samplers require one process and stratified=False")
+        if collate_fn is collate_samples:
+            raise ValueError("Custom batch samplers require an explicit compatible collate_fn")
+        sampler = batch_sampler
+    else:
+        sampler = AtomBatchSampler(dataset, order=order, seed=seed, batch_size=batch_size,
+                                   max_hessian_elements=max_hessian_elements, rank=rank, world_size=world_size)
     if stratified:
         sampler = StratifiedBatches(sampler)
     if max_batches is not None:
         sampler = LimitedBatches(sampler, max_batches)
+    if max_samples is not None:
+        sampler = LimitedSamples(sampler, max_samples)
+    if start_batch:
+        if start_batch < 0:
+            raise ValueError("Starting batch must be nonnegative")
+        sampler = SkipBatches(sampler, start_batch)
     kwargs = dict(dataset=dataset, batch_sampler=sampler, collate_fn=collate_fn,
                   num_workers=workers, pin_memory=pin_memory)
     if workers:
-        kwargs.update(persistent_workers=True, prefetch_factor=2, multiprocessing_context="spawn")
+        kwargs.update(persistent_workers=True, prefetch_factor=prefetch_factor, multiprocessing_context="spawn")
     return DataLoader(**kwargs)
 
 

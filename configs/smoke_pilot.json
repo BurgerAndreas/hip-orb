@@ -1,0 +1,11 @@
+{
+  "batch_size": 128,
+  "max_hessian_elements": 4000000,
+  "workers": 2,
+  "min_atoms": 50,
+  "max_atoms": 50,
+  "epochs": 20,
+  "max_steps": 64,
+  "validation_every": 32,
+  "validation_batches": 3
+}

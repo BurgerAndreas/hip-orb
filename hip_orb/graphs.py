@@ -32,10 +32,11 @@ def canonical_message_graph(graph):
 
 def refresh_message_vectors(graph):
     """Recompute molecular geometry on the inference device from final positions."""
-    if bool(graph.system_features["pbc"].any()):
-        raise NotImplementedError("CPU HIP graph preparation supports molecules only")
-    if bool((graph.edge_features["unit_shifts"] != 0).any()):
-        raise ValueError("Nonperiodic message edges have nonzero image shifts")
+    if not getattr(graph, "_hip_known_molecular", False):
+        if bool(graph.system_features["pbc"].any()):
+            raise NotImplementedError("CPU HIP graph preparation supports molecules only")
+        if bool((graph.edge_features["unit_shifts"] != 0).any()):
+            raise ValueError("Nonperiodic message edges have nonzero image shifts")
     graph.edge_features["vectors"] = (graph.node_features["positions"][graph.receivers]
                                       - graph.node_features["positions"][graph.senders])
     return graph

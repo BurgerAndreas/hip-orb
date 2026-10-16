@@ -6,10 +6,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH --mem=32G
-#SBATCH --output=logs/hip_step_%j.out
-#SBATCH --error=logs/hip_step_%j.err
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
+source "$PWD/scripts/load_env.sh"
 : "${HIP_LOADER_PYTHON:?Set an existing Python environment}"
 : "${HIP_LOADER_PACKAGE:?Set the HIP package folder}"
 : "${HIP_LOADER_EXTRAS:?Set the optional dependency folder}"
@@ -22,4 +21,4 @@ export OPENBLAS_NUM_THREADS=1
 if [[ -n "${HIP_STEP_SETUP:-}" ]]; then source "$HIP_STEP_SETUP"; fi
 "$HIP_LOADER_PYTHON" -m hip_orb.benchmark_training \
   --cache "$HIP_LOADER_CACHE" --checkpoint "$HIP_STEP_CHECKPOINT" --report "$HIP_STEP_REPORT" \
-  --local-cache-parent "${SLURM_TMPDIR:-${TMPDIR:-/tmp}}" --batch-size "${HIP_STEP_BATCH_SIZE:-4}"
+  --local-cache-parent "${HIP_LOCAL_CACHE_PARENT:?Set the private local cache path}" --batch-size "${HIP_STEP_BATCH_SIZE:-4}"

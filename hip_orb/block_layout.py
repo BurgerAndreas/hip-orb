@@ -42,11 +42,17 @@ def layout(sizes, device):
                 dense_sizes=dense_sizes)
 
 
-def assemble(layout, nodes, sizes, blocks, diagonal):
+def assemble(layout, nodes, sizes, blocks, diagonal, *, as_tensor=False):
     entries = layout["dense_sizes"]
     flat = nodes.new_zeros(sum(entries))
     flat[layout["dense_forward"]] = blocks.reshape(-1)
     # Reverse indices already transpose the destination coordinates.
     flat[layout["dense_reverse"]] = blocks.reshape(-1)
     flat[layout["dense_diag"]] = diagonal.reshape(-1)
+    if as_tensor == "packed":
+        return flat
+    if as_tensor:
+        if len(set(sizes)) != 1:
+            raise ValueError("Tensor Hessians require equal atom counts")
+        return flat.reshape(len(sizes), 3 * sizes[0], 3 * sizes[0])
     return [part.reshape(3*n, 3*n) for part, n in zip(flat.split(entries), sizes)]

@@ -7,12 +7,70 @@ import json
 import time
 from pathlib import Path
 
+import h5py
+import numpy as np
 import torch
+from ase import Atoms
 
 from hip_orb import ORB_COMMIT
+from hip_orb.data import unpack_hessian
 from hip_orb.metrics import hessian_metrics
 from hip_orb.model import HIPOrb
-from hip_orb.train import read_samples
+
+
+def read_samples(directory, count, minimum, maximum, assignments=None):
+    """Read a bounded benchmark; skip incomplete shards and retain scientific IDs."""
+    samples = []
+    paths = sorted(directory.glob("shard_*.h5")) or sorted(directory.glob("*/shard_*.h5"))
+    cap = count
+    if assignments is not None:
+        with np.load(assignments) as packed:
+            sizes = packed["shard_natoms"]
+        selected = np.flatnonzero((sizes >= minimum) & (sizes <= maximum))
+        groups = [selected[sizes[selected] == n] for n in np.unique(sizes[selected])]
+        if not groups:
+            raise ValueError("No shards in the requested atom range")
+        cap = int(np.ceil(count / len(groups)))
+        ids = [
+            int(group[row])
+            for row in range(max(map(len, groups)))
+            for group in groups
+            if row < len(group)
+        ]
+        paths = [directory / f"shard_{index:05d}.h5"
+                 if (directory / f"shard_{index:05d}.h5").exists()
+                 else directory / f"{index // 1000:03d}" / f"shard_{index:05d}.h5"
+                 for index in ids]
+    for path in paths:
+        if ".partial." in path.name:
+            continue
+        with h5py.File(path) as f:
+            if not bool(f.attrs.get("complete", False)):
+                continue
+            if str(f.attrs.get("model", "")) != "orbmol_v2":
+                raise ValueError("Benchmark requires OrbMol-v2 teacher labels")
+            accepted = 0
+            for row, n in enumerate(f["natoms"][:]):
+                if not minimum <= n <= maximum:
+                    continue
+                lo, hi = f["atom_ptr"][row : row + 2]
+                hlo, hhi = f["hessian_ptr"][row : row + 2]
+                atoms = Atoms(numbers=f["atomic_numbers"][lo:hi], positions=f["coords"][lo:hi])
+                atoms.info.update(charge=int(f["charge"][row]), spin=int(f["spin"][row]))
+                samples.append(
+                    (
+                        atoms,
+                        unpack_hessian(torch.from_numpy(f["hessian_upper"][hlo:hhi]), int(n)).numpy()
+                        if "hessian_upper" in f else f["hessian_flat"][hlo:hhi].reshape(3 * n, 3 * n),
+                        int(f["omol_index"][row]),
+                    )
+                )
+                if len(samples) == count:
+                    return samples
+                accepted += 1
+                if accepted >= cap:
+                    break
+    raise ValueError(f"Only {len(samples)} eligible benchmark records; need {count}")
 
 
 def enable_batched_harmonics():

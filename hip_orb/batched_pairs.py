@@ -8,7 +8,9 @@ def batch_topology(features):
     sizes = [int(n) for n in features.sizes.tolist()]
     if not sizes or min(sizes) < 1 or sum(sizes) != len(features.nodes):
         raise ValueError("Batch sizes do not cover the nodes")
-    indices = layout(tuple(sizes), str(features.nodes.device))
+    indices = getattr(features, "packed_layout", None)
+    if indices is None:
+        indices = layout(tuple(sizes), str(features.nodes.device))
     i, j = indices["i"], indices["j"]
     if features.pairs is not None:
         source, target, forward, reverse = [], [], [], []

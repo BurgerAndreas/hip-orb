@@ -6,10 +6,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=1
 #SBATCH --mem=32G
-#SBATCH --output=logs/hip_batched_%j.out
-#SBATCH --error=logs/hip_batched_%j.err
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
+source "$PWD/scripts/load_env.sh"
 : "${HIP_LOADER_PYTHON:?Set Python}"
 : "${HIP_LOADER_PACKAGE:?Set HIP package}"
 : "${HIP_LOADER_EXTRAS:?Set dependencies}"
