@@ -264,7 +264,7 @@ GPU annotations span elapsed device ranges; CPU operator GPU times measure attri
 Do not sum overlapping ranges or infer worker execution time from the main-process trace.
 Detailed traces remain private.
 
-The October 7 comparison completed on an H100 80GB in job 7238300.
+The October 7 comparison completed on an H100 80GB.
 Each variant used five warmup steps and two runs of twelve measured steps.
 Six sampled graph checks passed, including prediction and gradient agreement.
 The frozen backbone stayed unchanged.
@@ -323,7 +323,7 @@ The benchmark restores the measured head before validation.
 Profiler overhead and diagnostic updates stay outside all reported throughput timings.
 The benchmark does not measure a complete epoch or justify a dataset-wide time estimate.
 
-The first streaming comparison completed in job 7238595 on an H100 80GB.
+The first streaming comparison completed on an H100 80GB.
 Each strategy read 8,800 measured records in the first repeat and 10,296 in the second repeat.
 All paired record sequences matched, and the frozen backbone stayed unchanged.
 Eight sampled CPU graph checks passed, including head gradients.
@@ -344,7 +344,7 @@ The private results are in `outputs/training_e2e/report.json` and `outputs/train
 Those initial results include small identity checks in the update loop and extra sampler checks during startup.
 Use `outputs/clean_e2e` for measurements after the benchmark bookkeeping correction.
 
-The corrected comparison completed in job 7238942 with 512 measured steps per repeat.
+The corrected comparison used 512 measured steps per repeat.
 Each strategy used 26,759 measured records in the first repeat and 28,178 in the second.
 Shared update code preserves the production augmentation, graph path, precision, optimizer, and scalar reporting.
 The measured snapshot uses MSE, AdamW, and float32 high precision.
@@ -960,3 +960,10 @@ Validation passed: 302 CPU tests passed and 26 tests skipped. The completed GPU
 sweep covers all nine successful streaming cases. The first benchmark attempt
 failed during reference-loader worker startup; the repaired attempt completed.
 Private reports remain in `outputs/balanced_speed_20261016`.
+
+See [PRECISION.md](PRECISION.md) for the later BF16, FP16, and native FP8 experiments.
+Those experiments include backbone checks, backward audits, and streaming measurements.
+
+The later mixed-precision comparison retains the original 128-geometry plan and
+four-million-element cap. It uses four workers, prefetch depth four, and direct
+chunk reads. See [SPEED.md](SPEED.md) for the complete execution changes and checks.

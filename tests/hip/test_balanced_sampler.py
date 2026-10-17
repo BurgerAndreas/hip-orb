@@ -184,7 +184,7 @@ def test_runner_uses_packed_updates_and_resumes(monkeypatch, tmp_path, hessian_b
     monkeypatch.setattr(runner, "make_loader", loader)
     calls = []
 
-    def update(model, optimizer, batch, device, seed, loss_type):
+    def update(model, optimizer, batch, device, seed, loss_type, *, scaler=None):
         calls.append(loss_type)
         return 1.0, len(batch["sizes"])
 

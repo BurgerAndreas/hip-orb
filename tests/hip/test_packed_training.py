@@ -143,3 +143,39 @@ def test_segmented_projection_is_self_adjoint_and_has_the_correct_backward():
     (px * y).sum().backward()
     torch.testing.assert_close(x.grad, py, atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(project_packed(px, indices, sizes), px, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize("sizes", [(1,), (1, 2, 7), (3, 5)])
+@pytest.mark.parametrize("loss_type", ["block_rmse", "mse", "mae"])
+def test_compact_pair_loss_matches_dense_values_and_gradients(sizes, loss_type):
+    from hip_orb.packed_training import compact_indices, compact_loss
+
+    torch.manual_seed(19)
+    count = sum(sizes)
+    feature = Features(torch.randn(count, 4, dtype=torch.float64),
+                       torch.empty(0, 4, dtype=torch.float64),
+                       torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long),
+                       torch.randn(count, 3, dtype=torch.float64),
+                       torch.randn(count, dtype=torch.float64) * 0.1, torch.tensor(sizes))
+    head = HessianHead(4, 8, radial_features="bessel", all_to_all=True,
+                       neighbor_pooling=True, pair_residual_layers=1).double()
+    reference = copy.deepcopy(head)
+    dense_indices = packed_indices(sizes)
+    compact = compact_indices(sizes, "cpu")
+    upper = torch.randn(sum((3*n)*(3*n+1)//2 for n in sizes), dtype=torch.float64)
+    rotation = torch.linalg.qr(torch.randn(3, 3, dtype=torch.float64))[0]
+    dense = packed_blocks(type("Model", (), {"head": reference})(), feature,
+                          dense_indices, torch.tensor(sizes))
+    target = rotation @ upper[dense_indices["upper_ids"]].reshape(-1, 3, 3) @ rotation.T
+    expected = packed_loss(dense, target, dense_indices, loss_type)
+    feature.packed_layout = compact
+    pairs, diagonal = head._batched_forward(feature, as_tensor="pair-blocks")
+    got = compact_loss(pairs, diagonal, upper, rotation, compact, loss_type)
+    torch.testing.assert_close(got, expected, atol=1e-7, rtol=1e-7)
+    ga = torch.autograd.grad(got, tuple(head.parameters()), allow_unused=True)
+    gb = torch.autograd.grad(expected, tuple(reference.parameters()), allow_unused=True)
+    for a, b in zip(ga, gb, strict=True):
+        if a is None or b is None:
+            assert a is None and b is None
+        else:
+            torch.testing.assert_close(a, b, atol=1e-7, rtol=1e-7)

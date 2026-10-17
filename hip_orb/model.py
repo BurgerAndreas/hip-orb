@@ -202,6 +202,13 @@ class HessianHead(nn.Module):
     def _batched_forward(self, features, *, residual_only=False, as_tensor=False):
         sizes, i, j, forward, reverse, delta, distance = batch_topology(features)
         charges = features.charges.reshape(-1)
+        self.pair_adapter[0]._hip_input_grad_columns = None
+        if (getattr(self, "_radial_only_backward", False) and self.all_to_all
+                and self.radial_features_type == "bessel"
+                and not any(t.requires_grad for t in (features.nodes, features.edges,
+                                                     features.positions, features.charges))):
+            start = 3 * features.nodes.shape[-1] + 3
+            self.pair_adapter[0]._hip_input_grad_columns = (start, start + self.radial_bases + 1)
 
         def inputs(a, b, ids, direction, radii):
             present = ids >= 0
@@ -255,6 +262,8 @@ class HessianHead(nn.Module):
                                                             features.constant, features.sigma)
             blocks = blocks + coulomb
             diagonal = diagonal + coulomb_diagonal
+        if as_tensor == "pair-blocks":
+            return blocks, diagonal
         indices = getattr(features, "packed_layout", None)
         if indices is None:
             indices = layout(tuple(sizes), str(features.nodes.device))

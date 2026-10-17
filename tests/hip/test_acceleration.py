@@ -66,3 +66,18 @@ def test_known_charge_owners_preserve_orb_values_and_gradients(enforce, total_ch
     gb = torch.autograd.grad(expected.square().sum(), params)
     for a, b in zip(ga, gb, strict=True):
         torch.testing.assert_close(a, b, atol=1e-12, rtol=1e-12)
+
+
+def test_radial_backward_shortcut_requires_frozen_feature_inputs():
+    f = features((3, 5))
+    head = HessianHead(4, 8, radial_features="bessel", all_to_all=True).double()
+    head._radial_only_backward = True
+    head(f)
+    assert head.pair_adapter[0]._hip_input_grad_columns is None
+    for name in ("nodes", "edges", "positions", "charges"):
+        setattr(f, name, getattr(f, name).detach())
+    head(f)
+    assert head.pair_adapter[0]._hip_input_grad_columns == (15, 32)
+    f.positions.requires_grad_(True)
+    head(f)
+    assert head.pair_adapter[0]._hip_input_grad_columns is None

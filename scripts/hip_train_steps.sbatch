@@ -8,6 +8,10 @@
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 source "$PWD/scripts/load_env.sh"
+# Read the current pointer at each continuation, including exported environments.
+if [[ -f "$HIP_TRAIN_OUTPUT/runtime_next.txt" ]]; then
+  export HIP_TRAIN_RUNTIME_POINTER="$HIP_TRAIN_OUTPUT/runtime_next.txt"
+fi
 export HIP_RESUME_CHECKPOINT="$HIP_TRAIN_OUTPUT/head.pt"
 unset HIP_SESSION_SECONDS
 bash "$PWD/scripts/hip_train.sbatch"

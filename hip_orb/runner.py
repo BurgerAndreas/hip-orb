@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import time
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -12,17 +13,17 @@ import torch
 from ase import Atoms
 
 from hip_orb import ORB_COMMIT, ORB_VERSION
+from hip_orb.balanced_sampler import BalancedBatchSampler
 from hip_orb.benchmark_training import training_step
 from hip_orb.data import OrbMolDataset, make_loader, unpack_hessian
+from hip_orb.execution import EXECUTION_MODES, configure_execution
 from hip_orb.graphs import canonical_message_graph, refresh_message_vectors
+from hip_orb.losses import LOSS_TYPES
 from hip_orb.metrics import hessian_metrics
 from hip_orb.model import HIPOrb
-from hip_orb.losses import LOSS_TYPES
-from hip_orb.schedules import learning_rate
-from hip_orb.preparation import prepare_batch
-from hip_orb.execution import EXECUTION_MODES, configure_execution
-from hip_orb.balanced_sampler import BalancedBatchSampler
 from hip_orb.packed_training import collate_packed_compact, packed_update
+from hip_orb.preparation import prepare_batch
+from hip_orb.schedules import learning_rate
 
 
 def timed_batches(loader, timing):
@@ -125,6 +126,8 @@ def main():
     parser.add_argument("--batch-max-atoms", type=int, default=4096)
     parser.add_argument("--batch-window-shards", type=int, default=8)
     parser.add_argument("--batch-order", choices=("global", "locality"), default="locality")
+    parser.add_argument("--loader-cache-mode", choices=("arrays", "chunks"), default="arrays")
+    parser.add_argument("--validation-cache-mode", choices=("arrays", "chunks"), default="arrays")
     parser.add_argument("--loader-cache-mib", type=int, default=256)
     parser.add_argument("--loader-open-files", type=int, default=8)
     parser.add_argument("--prefetch-factor", type=int, default=2)
@@ -175,6 +178,11 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--execution-mode", choices=EXECUTION_MODES, default="optimized",
                         help="Use float32 optimizations or the eager reference implementation")
+    parser.add_argument("--packed-loss-implementation", choices=("dense", "pairs"), default="dense")
+    parser.add_argument("--linear-input-alignment", type=int, choices=(1, 8, 16, 32, 64), default=1)
+    parser.add_argument("--radial-only-backward", action="store_true")
+    parser.add_argument("--fused-optimizer", action="store_true")
+    parser.add_argument("--precision-policy", choices=("float32", "fp16-message-head"), default="float32")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--translation-scale", type=float, default=0.0,
                         help="Random shifts per molecule, uniform within +/- this many angstroms")
@@ -208,6 +216,16 @@ def main():
             or args.translation_scale or args.consistency_weight
             or args.reference_views != 1 or args.rotation_sampling != "uniform"):
         parser.error("Balanced packed training requires one uniform view, no shifts or consistency, and block_rmse/mse/mae")
+    if args.precision_policy != "float32" and (args.batching != "balanced" or not args.device.startswith("cuda")):
+        parser.error("Mixed precision requires balanced packed training on CUDA")
+    if args.linear_input_alignment != 1 and args.precision_policy == "float32":
+        parser.error("Input alignment requires mixed precision")
+    if args.fused_optimizer and not args.device.startswith("cuda"):
+        parser.error("Fused optimizer requires CUDA")
+    if args.radial_only_backward and args.precision_policy == "float32":
+        parser.error("Restricted radial backward requires mixed precision")
+    if args.packed_loss_implementation == "pairs" and (args.batching != "balanced" or args.translation_projection):
+        parser.error("Pair-block loss requires balanced batches without translation projection")
     augmentation_config = {"rotation": ("haar_so3_qr_v2" if args.rotation_sampling == "uniform"
                                         else "legacy_qr_v1"),
                            "translation_scale_angstrom": args.translation_scale,
@@ -248,9 +266,9 @@ def main():
     if args.session_duration_seconds is not None and (
             not math.isfinite(args.session_duration_seconds) or args.session_duration_seconds <= 0):
         parser.error("Session duration must be positive and finite")
-    training = OrbMolDataset(args.train_index, training_only=True,
+    training = OrbMolDataset(args.train_index, training_only=True, cache_mode=args.loader_cache_mode,
                              cache_bytes=args.loader_cache_mib << 20, max_open=args.loader_open_files)
-    validation = OrbMolDataset(args.validation_index, training_only=True)
+    validation = OrbMolDataset(args.validation_index, training_only=True, cache_mode=args.validation_cache_mode)
     if set(training.paths) & set(validation.paths) or set(training.sources) & set(validation.sources):
         parser.error("Training and validation must use separate sources and shard files")
     for dataset in (training, validation):
@@ -301,7 +319,31 @@ def main():
                               all_to_all=args.all_to_all, orb_initialization=args.orb_initialization,
                               orb_message_graph=args.orb_message_graph, **weights)
     execution_config = configure_execution(model, args.execution_mode)
-    optimizer = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=0)
+    model.head._radial_only_backward = args.radial_only_backward
+    model._compact_pair_loss = args.packed_loss_implementation == "pairs"
+    execution_config.update(linear_input_alignment=args.linear_input_alignment,
+                            fused_optimizer=args.fused_optimizer,
+                            radial_only_backward=args.radial_only_backward,
+                            packed_loss_implementation=args.packed_loss_implementation,
+                            loader={"workers": args.workers, "prefetch_factor": args.prefetch_factor,
+                                    "cache_mib": args.loader_cache_mib, "open_files": args.loader_open_files,
+                                    "cache_mode": args.loader_cache_mode,
+                                    "validation_cache_mode": args.validation_cache_mode})
+    optimizer = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=0,
+                                  fused=args.fused_optimizer)
+    scaler = None
+    precision_context = nullcontext()
+    if args.precision_policy != "float32":
+        from hip_orb.mixed_precision import LinearPolicy, linear_precision
+        precision_context = linear_precision(
+            model, head=LinearPolicy("fp16_f32", fuse_silu=True, activation_dtype="fp16",
+                                    input_alignment=args.linear_input_alignment),
+            backbone=LinearPolicy("fp16", include=("base.model.gnn_stacks.*._*mlp.mlp.NN-*",),
+                                  activation_dtype="fp16"))
+        scaler = torch.amp.GradScaler("cuda", init_scale=1024)
+        execution_config.update(head_precision="fp16-input-fp32-output-fused-silu",
+                                backbone_precision="fp16-message-mlps-fp32-residuals")
+    skipped_updates = 0
     global_step = 0
     previous_elapsed, last_validation_elapsed = 0.0, 0.0
     resume_epoch, epoch_batches = 0, 0
@@ -319,8 +361,16 @@ def main():
             raise ValueError("Checkpoint augmentation or consistency settings differ")
         if saved.get("batching_config", {"mode": "equal"}) != batching_config:
             raise ValueError("Checkpoint batch plan or batching settings differ")
+        if saved.get("precision_policy", "float32") != args.precision_policy:
+            raise ValueError("Checkpoint precision policy differs")
+        if scaler is not None:
+            scaler.load_state_dict(saved["grad_scaler"])
+        skipped_updates = saved.get("skipped_updates", 0)
         model.head.load_state_dict(saved["head"])
         if "optimizer" in saved:
+            # Set the backend before loading, so AdamW places step counters correctly.
+            for group in saved["optimizer"]["param_groups"]:
+                group.update(fused=args.fused_optimizer, foreach=None)
             optimizer.load_state_dict(saved["optimizer"])
         global_step = saved.get("global_step", 0)
         previous_elapsed = saved.get("training_elapsed_s", 0.0)
@@ -363,7 +413,10 @@ def main():
                       "augmentation_config": augmentation_config,
                       "optimizer": optimizer.state_dict(), "global_step": global_step,
                       "orb_commit": ORB_COMMIT, "orb_version": ORB_VERSION,
-                      "precision": "float32-high",
+                      "precision": "float32-high" if scaler is None else "mixed-fp16-fp32",
+                      "precision_policy": args.precision_policy,
+                      "grad_scaler": None if scaler is None else scaler.state_dict(),
+                      "skipped_updates": skipped_updates,
                       "execution_config": execution_config, "execution_history": execution_history,
                       "teacher": "orbmol_v2",
                       "lr_schedule_config": schedule_config,
@@ -379,13 +432,17 @@ def main():
         temporary.replace(args.output / "head.pt")
 
     final = None
+    precision_stack = ExitStack()
     try:
+        precision_stats = precision_stack.enter_context(precision_context)
         print(json.dumps({"event": "training_started", "global_step": global_step,
                           "head_config": model.head.config,
                           "execution_config": execution_config,
                           "batching_config": batching_config,
                           "elapsed_s": previous_elapsed, "batch_size": args.batch_size,
                           "loss_type": args.loss_type,
+                          "precision_policy": args.precision_policy,
+                          "precision_layers": precision_stats,
                           "max_steps": args.max_steps, "lr_schedule_config": schedule_config,
                           "validation_batch_size": validation_common["batch_size"]}), flush=True)
         for epoch in range(resume_epoch, args.epochs):
@@ -404,9 +461,10 @@ def main():
                 for group in optimizer.param_groups:
                     group["lr"] = update_lr
                 update_started = time.perf_counter()
+                scale_before = None if scaler is None else scaler.get_scale()
                 if args.batching == "balanced":
                     loss, size = packed_update(model, optimizer, batch, args.device,
-                                               args.seed + epoch, loss_type=args.loss_type)
+                                               args.seed + epoch, loss_type=args.loss_type, scaler=scaler)
                 else:
                     loss, size = train_update(model, optimizer, batch, args.device, args.seed + epoch,
                                           loss_type=args.loss_type,
@@ -420,8 +478,13 @@ def main():
                 timing["samples"] += size
                 loss_sum += loss * size
                 samples += size
-                global_step += 1
                 epoch_batches += 1
+                if scaler is not None and scaler.get_scale() < scale_before:
+                    skipped_updates += 1
+                    print(json.dumps({"event": "optimizer_update_skipped", "global_step": global_step,
+                                      "grad_scale": scaler.get_scale(), "skipped_updates": skipped_updates}), flush=True)
+                    continue
+                global_step += 1
                 # Keep bounded diagnostics, not a list proportional to a long run.
                 if len(training_batch_sizes) < 1024:
                     training_batch_sizes.append(size)
@@ -475,6 +538,7 @@ def main():
                   "execution_history": execution_history,
                   "augmentation_config": augmentation_config,
                   "atom_range": [args.min_atoms, args.max_atoms],
+                  "precision_policy": args.precision_policy, "skipped_updates": skipped_updates,
                   "global_step": global_step, "batch_size": args.batch_size,
                   "validation_batch_size": validation_common["batch_size"],
                   "validation_sample_limit": args.validation_samples,
@@ -498,6 +562,7 @@ def main():
         print(json.dumps({key: report[key] for key in ("global_step", "validation", "validation_samples",
                          "final_validation_completed", "checkpoint_readable")}), flush=True)
     finally:
+        precision_stack.close()
         for loader, dataset in ((train_loader, training), (validation_loader, validation)):
             if getattr(loader, "_iterator", None) is not None:
                 loader._iterator._shutdown_workers()

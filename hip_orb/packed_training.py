@@ -226,34 +226,55 @@ def packed_loss(blocks, target, indices, loss_type="block_rmse"):
     return (values * indices["block_weight"]).sum()
 
 
-def packed_update(model, optimizer, batch, device="cuda", seed=7, loss_type="block_rmse"):
+def packed_update(model, optimizer, batch, device="cuda", seed=7, loss_type="block_rmse", *, scaler=None):
     with torch.profiler.record_function("packed_prepare"):
         batch = prepare_packed(batch, seed)
     with torch.profiler.record_function("packed_graph_and_indices"):
         graph = packed_graph(batch, model.adapter, device)
-        if "indices" in batch:
+        compact = (getattr(model, "_compact_pair_loss", False)
+                   and not model.head.translation_projection
+                   and not hasattr(model.head, "orb_distance_encoder"))
+        if compact:
+            indices = compact_indices(tuple(batch["sizes"].tolist()), str(device))
+        elif "indices" in batch:
             indices = {
                 k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                 for k, v in batch["indices"].items()
             }
         else:
             indices = device_indices(batch["sizes"], device)
-        graph._hip_dense_topology = indices["dense_a"], indices["dense_b"]
+        if "dense_a" in indices:
+            graph._hip_dense_topology = indices["dense_a"], indices["dense_b"]
     with torch.profiler.record_function("packed_frozen_backbone"):
         feature = model.features(graph, sizes=batch["sizes"])
     with torch.profiler.record_function("packed_head_and_loss"):
         upper = batch["hessian_upper"].to(device, non_blocking=True)
         r = batch["rotation"].to(device, non_blocking=True)
-        target = upper[indices["upper_ids"]].reshape(-1, 3, 3)
-        target = r @ target @ r.T
-        blocks = packed_blocks(model, feature, indices, batch["sizes"])
-        loss = packed_loss(blocks, target, indices, loss_type)
+        if compact:
+            feature.packed_layout = indices
+            blocks, diagonal = model.head._batched_forward(feature, as_tensor="pair-blocks")
+            loss = compact_loss(blocks, diagonal, upper, r, indices, loss_type)
+        else:
+            target = upper[indices["upper_ids"]].reshape(-1, 3, 3)
+            target = r @ target @ r.T
+            blocks = packed_blocks(model, feature, indices, batch["sizes"])
+            loss = packed_loss(blocks, target, indices, loss_type)
     require(torch.isfinite(loss), "Packed training loss is not finite")
     with torch.profiler.record_function("packed_backward_and_optimizer"):
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        if scaler is None:
+            loss.backward()
+        else:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.head.parameters(), 10.0)
-        optimizer.step()
+        if scaler is None:
+            optimizer.step()
+        else:
+            scaler.step(optimizer)
+            scaler.update()
+        from hip_orb.mixed_precision import invalidate_trainable_precision_caches
+        invalidate_trainable_precision_caches(model)
     return float(loss.detach()), len(batch["sizes"])
 
 
@@ -349,3 +370,53 @@ def _device_indices(values, device):
         "dense_a": da + offsets[downer],
         "dense_b": db + offsets[downer],
     }
+
+
+@lru_cache(maxsize=8)
+def compact_indices(values, device):
+    """Index independent pair blocks and diagonal blocks without dense matrices."""
+    sizes = torch.tensor(values, device=device, dtype=torch.long)
+    owners = torch.arange(len(values), device=device)
+    total_nodes = sum(values)
+    total_pairs = sum(n * (n - 1) // 2 for n in values)
+    node_owner = owners.repeat_interleave(sizes, output_size=total_nodes)
+    counts = sizes * (sizes - 1) // 2
+    pair_owner = owners.repeat_interleave(counts, output_size=total_pairs)
+    offsets = F.pad(sizes.cumsum(0), (1, 0))
+    pair_offsets = F.pad(counts.cumsum(0), (1, 0))
+    upper_offsets = F.pad(((3 * sizes) * (3 * sizes + 1) // 2).cumsum(0), (1, 0))
+    t = torch.arange(total_pairs, device=device) - pair_offsets[pair_owner]
+    n = sizes[pair_owner]
+    a = n - 2 - torch.floor((torch.sqrt((4 * n * (n - 1) - 8 * t - 7).double()) - 1) / 2).long()
+    b = t - a * (2 * n - a - 1) // 2 + a + 1
+    xyz = torch.arange(3, device=device)
+    row, col = 3 * a[:, None, None] + xyz[None, :, None], 3 * b[:, None, None] + xyz[None, None, :]
+    d = 3 * n[:, None, None]
+    pair_upper = upper_offsets[pair_owner, None, None] + row * d - row * (row - 1) // 2 + col - row
+    node = torch.arange(total_nodes, device=device) - offsets[node_owner]
+    row, col = 3 * node[:, None, None] + xyz[None, :, None], 3 * node[:, None, None] + xyz[None, None, :]
+    lo, hi = torch.minimum(row, col), torch.maximum(row, col)
+    d = 3 * sizes[node_owner, None, None]
+    diag_upper = upper_offsets[node_owner, None, None] + lo * d - lo * (lo - 1) // 2 + hi - lo
+    return {"i": a + offsets[pair_owner], "j": b + offsets[pair_owner], "node_owner": node_owner,
+            "pair_upper": pair_upper, "diag_upper": diag_upper,
+            "pair_weight": 2.0 / (len(values) * n.float().square()),
+            "diag_weight": 1.0 / (len(values) * sizes[node_owner].float().square())}
+
+
+def compact_loss(blocks, diagonal, upper, rotation, indices, loss_type="block_rmse"):
+    """Weight symmetric off-diagonal blocks twice and diagonal blocks once."""
+    def terms(prediction, ids, weights):
+        target = rotation @ upper[ids] @ rotation.T
+        error = prediction - target
+        if loss_type == "block_rmse":
+            values = torch.linalg.vector_norm(error, dim=(1, 2)) / 3
+        elif loss_type == "mse":
+            values = error.square().mean((1, 2))
+        elif loss_type == "mae":
+            values = error.abs().mean((1, 2))
+        else:
+            raise ValueError("Compact loss supports block_rmse, mse, and mae")
+        return (values * weights).sum()
+    return terms(blocks, indices["pair_upper"], indices["pair_weight"]) + terms(
+        diagonal, indices["diag_upper"], indices["diag_weight"])

@@ -107,7 +107,7 @@ Four loader workers use persistent processes, prefetch four batches each, and ca
 Set `HIP_SLURM_CPUS_PER_TASK=8` in `.env` for this loader configuration.
 Validation retains equal-size batches, with a maximum of 256 geometries and an eight-million-element Hessian budget.
 Historical comparison configurations retain their recorded batch limits.
-The active `batch_short` experiments use two-hour jobs and checkpoint after 25,000 updates or 90 minutes.
+The short-session experiments use two-hour jobs and checkpoint after 25,000 updates or 90 minutes.
 Set `HIP_SLURM_PARTITION` and optional `HIP_SLURM_TIME_LIMIT` in the private environment for these submissions.
 Training continuations inherit the actual Slurm partition if a pending job moves partitions.
 Use `scripts/hip_train_steps.sbatch` on clusters with four-hour GPU limits.

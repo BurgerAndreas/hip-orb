@@ -126,3 +126,16 @@ def test_timed_run_stops_updates_and_always_validates(monkeypatch, tmp_path, ses
                                             "--loss-type", other_loss])
     with pytest.raises(ValueError, match="Checkpoint Hessian loss differs"):
         runner.main()
+
+
+@pytest.mark.parametrize("batching,device", [("equal", "cuda"), ("balanced", "cpu")])
+def test_mixed_precision_requires_cuda_packed_training(monkeypatch, tmp_path, batching, device):
+    monkeypatch.setattr(runner.HIPOrb, "pretrained", lambda *a, **k: pytest.fail("Model must not load"))
+    monkeypatch.setattr(sys, "argv", ["train", "--train-index", str(tmp_path / "train.npz"),
+                                     "--validation-index", str(tmp_path / "val.npz"),
+                                     "--output", str(tmp_path), "--batching", batching,
+                                     "--device", device, "--loss-type", "block_rmse",
+                                     "--precision-policy", "fp16-message-head"])
+    with pytest.raises(SystemExit) as error:
+        runner.main()
+    assert error.value.code == 2
