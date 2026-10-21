@@ -3,6 +3,67 @@
 This fork adds Hessian readouts to frozen OrbMol-v2 v0.7.0.
 The Hessian graph is fully connected by default and separate from the backbone graph.
 See [HIP.md](HIP.md) for details.
+
+## Train the Hessian head
+
+The new default is [`configs/train.json`](configs/train.json), for one NVIDIA H100 80 GB GPU and eight CPU cores.
+It freezes OrbMol-v2 and trains one context round with width 256, internal MLP width 1024, and two residual pair layers.
+The Hessian graph is fully connected. It uses 16 independent Bessel features plus log distance, with a 12 Å radial scale.
+
+| Setting | Default |
+|---|---|
+| Training batches | Atom-balanced; at most 64 geometries and 1,792 atoms; no Hessian-element cap |
+| Loss and augmentation | Block RMSE; one corrected uniform rotation; one view; no consistency term or translation projection |
+| Optimizer and schedule | AdamW, no weight decay; peak LR 0.001; 15% linear warmup, then cosine decay |
+| Training budget | 2,000,000 successful updates; no overall time limit |
+| Validation | Every 200,000 updates and at the end; 10,000 geometries; batch cap 256 |
+| Execution | Optimized FP32 policy; locally scaled FP16 only in verified matrix operations; FP32 parameters and gradients; fused AdamW |
+| Loader | Four persistent workers, prefetch four, HDF5 chunk reads; locality-aware batch order |
+
+Run these commands in Bash from the repository root. Install the fork and create a private environment file:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[hip]" huggingface_hub
+test -f .env || cp .env.example .env
+```
+
+Set your storage root, Python interpreter, scheduler account, and partition in `.env`.
+Keep `HIP_TRAIN_CONFIG="$PWD/configs/train.json"` and select a fresh `HIP_TRAIN_OUTPUT` for this default.
+Leave the runtime package and pointer empty to train from this checkout.
+Accept the access terms on [HIP-OrbMol-OMol25](https://huggingface.co/datasets/andreasburger/HIP-OrbMol-OMol25).
+Put a Hugging Face read token for the approved account in `HF_TOKEN` in `.env`.
+
+Inside a CPU allocation, load the environment and download the packed labels and original teacher weights:
+
+```bash
+source scripts/load_env.sh
+hf download "$HIP_DATA_REPO" --repo-type dataset --local-dir "$HIP_DATA_DIR"
+mkdir -p "$(dirname "$HIP_STEP_CHECKPOINT")"
+curl --fail --location \
+  https://orbitalmaterials-public-models.s3.us-west-1.amazonaws.com/forcefields/orbmol-v2-teqabfhg-20260523.ckpt \
+  --output "$HIP_STEP_CHECKPOINT"
+"$HIP_LOADER_PYTHON" -m hip_orb.prepare_data \
+  --train-shards "$HIP_DATA_DIR/shards" \
+  --validation-shards "$HIP_DATA_DIR/validation/shards" \
+  --train-index "$HIP_TRAIN_INDEX" --validation-index "$HIP_VALIDATION_INDEX" \
+  --config "$HIP_TRAIN_CONFIG" --output "$HIP_TRAIN_OUTPUT"
+```
+
+The labels need no format conversion. Preparation builds private metadata indexes and caches the balanced batch plan once on CPUs.
+It checks that training and validation use separate sources. Training reuses the plan.
+
+Submit training through Slurm:
+
+```bash
+bash scripts/submit_job.sh scripts/hip_train_steps.sbatch --job-name=hip-context-default
+```
+
+Each allocation saves after 25,000 updates or 90 minutes, then submits a continuation until training finishes.
+Use a scheduler time limit of at least two hours. Checkpoints retain optimizer, scaler, sampler position, and schedule state.
+Existing runs keep their original configurations and batch plans. See [SPEED.md](SPEED.md) for measured execution results.
+
 The original Orb model and training documentation follows below.
 
 ---

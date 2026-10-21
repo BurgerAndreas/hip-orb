@@ -1,7 +1,7 @@
 {
   "batch_size": 128,
   "max_hessian_elements": 4000000,
-  "workers": 2,
+  "workers": 4,
   "min_atoms": 2,
   "max_atoms": 350,
   "epochs": 1000000,
@@ -37,5 +37,9 @@
   "all_to_all": true,
   "hessian_cutoff": null,
   "orb_initialization": "random",
-  "orb_message_graph": "backbone"
+  "orb_message_graph": "backbone",
+  "prefetch_factor": 4,
+  "loader_cache_mode": "chunks",
+  "validation_cache_mode": "chunks",
+  "loader_open_files": 16
 }

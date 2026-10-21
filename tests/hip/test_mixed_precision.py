@@ -328,3 +328,210 @@ def test_versionless_updates_invalidate_trainable_casts_and_restore_scope():
         after = model.head(x)
         assert not torch.equal(before, after)
     assert not hasattr(model, "_hip_precision_trainable_caches")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Fused head kernels need CUDA")
+@pytest.mark.parametrize("shape", [(7, 17, 9), (71, 791, 64), (513, 1024, 256)])
+@pytest.mark.parametrize("half_output", [False, True])
+def test_head_fusion_forward_and_backward(shape, half_output):
+    from hip_orb.precision_kernels import fused_half_silu
+
+    torch.manual_seed(159)
+    m, k, n = shape
+    x = torch.randn(m, k, device="cuda", requires_grad=True)
+    w = (torch.randn(n, k, device="cuda") / k**0.5).requires_grad_()
+    b = torch.randn(n, device="cuda", requires_grad=True)
+    reference = fused_half_silu(x, w, b, alignment=16, half_output=half_output)
+    probe = torch.randn_like(reference)
+    expected = torch.autograd.grad(reference, (x, w, b), probe)
+    actual = fused_half_silu(x, w, b, alignment=16, half_output=half_output,
+                             fused_input_cast=True)
+    error = (actual.float() - reference.float()).norm() / reference.float().norm()
+    assert error < 0.001
+    got = torch.autograd.grad(actual, (x, w, b), probe)
+    for a, e in zip(got, expected, strict=True):
+        assert (a.float() - e.float()).norm() / e.float().norm().clamp_min(1e-12) < 0.002
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Fused head kernels need CUDA")
+def test_fused_cast_padding_with_strided_inputs():
+    from hip_orb.head_fusion import cast_half_padded
+
+    for dtype in (torch.float32, torch.float16):
+        x = torch.randn(19, 34, device="cuda", dtype=dtype)[:, ::2]
+        got = cast_half_padded(x, 32)
+        torch.testing.assert_close(got[:, :17], x.half(), atol=0, rtol=0)
+        assert not got[:, 17:].any()
+        assert cast_half_padded(x, 17).shape == x.shape
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Fused pair inputs need CUDA")
+def test_fused_pair_inputs_with_missing_edges_and_radial_gradients():
+    from hip_orb.head_fusion import frozen_pair_inputs
+
+    torch.manual_seed(190)
+    nodes = torch.randn(5, 16, device="cuda")
+    edges = torch.randn(3, 16, device="cuda")
+    charges = torch.randn(5, device="cuda")
+    a = torch.tensor([0, 2, 4, 1], device="cuda")
+    b = torch.tensor([1, 4, 0, 3], device="cuda")
+    ids = torch.tensor([0, -1, 2, -1], device="cuda")
+    direction = torch.randn(4, 3, device="cuda")
+    radii = torch.randn(4, 17, device="cuda", requires_grad=True)
+    edge = torch.cat((edges, nodes.new_zeros(1, 16)))[torch.where(ids < 0, 3, ids)]
+    expected = torch.cat((nodes[a], nodes[b], edge, direction, radii,
+                          charges[a, None], charges[b, None], (ids >= 0)[:, None]), dim=1)
+    got = frozen_pair_inputs(nodes, edges, charges, a, b, ids, direction, radii)
+    torch.testing.assert_close(got, expected, atol=0, rtol=0)
+    probe = torch.randn_like(got)
+    actual_grad = torch.autograd.grad(got, radii, probe)[0]
+    expected_grad = torch.autograd.grad(expected, radii, probe)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="frozen"):
+        frozen_pair_inputs(nodes.requires_grad_(), edges, charges, a, b, ids, direction, radii)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Direct radial backward needs CUDA")
+@pytest.mark.parametrize("rows", [0, 71])
+def test_direct_radial_backward_avoids_full_input_gradient(rows):
+    from hip_orb.precision_kernels import fused_half_silu
+
+    torch.manual_seed(291)
+    frozen = torch.randn(rows, 768, device="cuda")
+    radial = torch.randn(rows, 17, device="cuda", requires_grad=True)
+    x = torch.cat((frozen, radial), dim=1)
+    w = (torch.randn(64, 785, device="cuda") * 0.02).requires_grad_()
+    b = torch.randn(64, device="cuda", requires_grad=True)
+    expected = fused_half_silu(x, w, b, alignment=16, input_grad_columns=(768, 785))
+    actual = fused_half_silu(x.detach(), w, b, alignment=16, input_grad_columns=(768, 785),
+                             radial_source=radial, fused_input_cast=True)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    probe = torch.randn_like(actual)
+    ga = torch.autograd.grad(actual, (radial, w, b), probe)
+    ge = torch.autograd.grad(expected, (radial, w, b), probe)
+    for a, e in zip(ga, ge, strict=True):
+        torch.testing.assert_close(a, e, atol=2e-5, rtol=2e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Head fusion guards need CUDA")
+@pytest.mark.parametrize("trainable_features", [False, True])
+def test_head_input_fusion_preserves_full_head_and_feature_gradients(trainable_features):
+    from hip_orb.model import Features, HessianHead
+
+    torch.manual_seed(391)
+    model = torch.nn.Module()
+    model.head = HessianHead(4, 8, radial_features="bessel", all_to_all=True,
+                             radial_bases=3, mlp_hidden=16, neighbor_pooling=True).cuda()
+    feature = Features(
+        torch.randn(5, 4, device="cuda", requires_grad=trainable_features),
+        torch.randn(4, 4, device="cuda", requires_grad=trainable_features),
+        torch.tensor([0, 1, 2, 3], device="cuda"),
+        torch.tensor([1, 0, 3, 2], device="cuda"),
+        torch.randn(5, 3, device="cuda", requires_grad=trainable_features),
+        torch.randn(5, device="cuda", requires_grad=trainable_features),
+        torch.tensor([2, 3], device="cuda"))
+    model.head._radial_only_backward = True
+    params = tuple(model.head.parameters())
+    if trainable_features:
+        params += (feature.nodes, feature.edges, feature.positions, feature.charges)
+    policy = LinearPolicy("fp16_f32", fuse_silu=True, activation_dtype="fp16", input_alignment=16)
+    with linear_precision(model, head=policy):
+        expected = torch.cat([v.flatten() for v in model.head(feature)])
+        probe = torch.randn_like(expected)
+        reference_grad = torch.autograd.grad(expected, params, probe)
+        model.head._fused_pair_inputs = True
+        got = torch.cat([v.flatten() for v in model.head(feature)])
+        actual_grad = torch.autograd.grad(got, params, probe)
+        torch.testing.assert_close(got, expected, atol=2e-5, rtol=2e-4)
+        for actual, reference in zip(actual_grad, reference_grad, strict=True):
+            torch.testing.assert_close(actual, reference, atol=2e-4, rtol=0.002)
+        assert model.head.pair_adapter[0]._hip_radial_source is None
+        if trainable_features:
+            assert model.head.pair_adapter[0]._hip_input_grad_columns is None
+
+
+def test_targeted_fp32_boundary_accepts_half_input_and_preserves_gradients():
+    model = Small()
+    reference = copy.deepcopy(model)
+    x = torch.randn(7, 17, dtype=torch.float16, requires_grad=True)
+    original = model.head[0].forward
+    with linear_precision(model, head=LinearPolicy('bf16'),
+                          overrides={'head.0': LinearPolicy('fp32')}) as stats:
+        actual = model.head(x)
+        expected = reference.head(x.float())
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        actual.sum().backward()
+        expected.sum().backward()
+        for p, q in zip(model.head.parameters(), reference.head.parameters(), strict=True):
+            torch.testing.assert_close(p.grad, q.grad, atol=0, rtol=0)
+        assert stats['overrides'] == {'head.0': 'fp32'}
+    assert model.head[0].forward == original
+
+
+@pytest.mark.parametrize('overrides,match', [
+    ({'head.missing': LinearPolicy('fp32')}, 'Unmatched'),
+    ({'head.*': LinearPolicy('fp32'), 'head.0': LinearPolicy('bf16')}, 'Overlapping'),
+])
+def test_precision_override_errors_restore_all_forwards(overrides, match):
+    model = Small()
+    originals = {name: module.forward for name, module in model.named_modules()}
+    with (pytest.raises(ValueError, match=match),
+          linear_precision(model, head=LinearPolicy('bf16'), overrides=overrides)):
+        pass
+    assert all(module.forward == originals[name] for name, module in model.named_modules())
+    assert not hasattr(model, '_hip_precision_trainable_caches')
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA half-input FP32-output GEMM')
+@pytest.mark.parametrize('safe_policy', [LinearPolicy('fp32'), LinearPolicy('fp16_scaled')])
+def test_targeted_policy_handles_half_activation_overflow_and_backward(safe_policy):
+    model = Small().cuda()
+    with torch.no_grad():
+        model.head[0].weight.fill_(64)
+        model.head[0].bias.zero_()
+        model.head[2].weight.fill_(1 / 32)
+        model.head[2].bias.zero_()
+    reference = copy.deepcopy(model)
+    x = torch.full((7, 17), 128.0, device='cuda', requires_grad=True)
+    policy = LinearPolicy('fp16_f32', fuse_silu=True, activation_dtype='fp16')
+    with torch.no_grad(), linear_precision(model, head=policy):
+        assert not torch.isfinite(model.head(x)).all()
+    with linear_precision(model, head=policy, overrides={'head.0': safe_policy}):
+        actual = model.head(x)
+        expected = reference.head(x)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=1e-3)
+        actual.sum().backward()
+        expected.sum().backward()
+        for p, q in zip(model.head.parameters(), reference.head.parameters(), strict=True):
+            assert torch.isfinite(p.grad).all()
+            torch.testing.assert_close(p.grad, q.grad, atol=0, rtol=1e-3)
+
+
+def test_context_precision_boundary_must_cover_the_next_matrix_product():
+    model = Small()
+    model.head = torch.nn.Module()
+    model.head.node_update = torch.nn.Sequential(
+        torch.nn.Linear(4, 4, bias=False), torch.nn.SiLU(),
+        torch.nn.Linear(4, 4, bias=False), torch.nn.SiLU(),
+        torch.nn.Linear(4, 4, bias=False))
+    with torch.no_grad():
+        model.head.node_update[0].weight.fill_(1)
+        model.head.node_update[2].weight.fill_(3.25)
+        model.head.node_update[4].weight.fill_(16)
+    reference = copy.deepcopy(model)
+    x = torch.full((7, 4), 1277.0, requires_grad=True)
+    # FP32 output at the failing layer alone still overflows the next FP16 input cast.
+    with linear_precision(model, head=LinearPolicy('fp16'),
+                          overrides={'head.node_update.2': LinearPolicy('fp32')}):
+        assert not torch.isfinite(model.head.node_update(x)).all()
+    with linear_precision(model, head=LinearPolicy('fp16'),
+                          overrides={'head.node_update.*': LinearPolicy('fp32')}):
+        actual = model.head.node_update(x)
+        expected = reference.head.node_update(x)
+        assert actual.max() > 3_000_000
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        actual.sum().backward()
+        expected.sum().backward()
+        for p, q in zip(model.head.parameters(), reference.head.parameters(), strict=True):
+            assert torch.isfinite(p.grad).all()
+            torch.testing.assert_close(p.grad, q.grad, atol=0, rtol=0)

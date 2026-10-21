@@ -904,9 +904,9 @@ validation. They include the measured loader and training update time.
 Use `HIP_SLURM_CPUS_PER_TASK` in `.env` to reserve CPUs for loader workers.
 The submission script passes this setting to checkpoint continuations.
 
-#### Selected defaults and measured results
+#### Earlier loader defaults and measured results
 
-`configs/train.json` now selects balanced batches with at most 64 geometries
+The earlier loader-only default selected balanced batches with at most 64 geometries
 and 2,560 atoms. It disables the Hessian-element cap. It preserves the existing
 model architecture and optimizer schedule. Four persistent loader workers use
 prefetch depth four, 1 GiB of array cache each, and 16 open files each.
@@ -967,3 +967,8 @@ Those experiments include backbone checks, backward audits, and streaming measur
 The later mixed-precision comparison retains the original 128-geometry plan and
 four-million-element cap. It uses four workers, prefetch depth four, and direct
 chunk reads. See [SPEED.md](SPEED.md) for the complete execution changes and checks.
+
+The current default in `configs/train.json` keeps uncapped 64-geometry, 2,560-atom batches.
+It adds the wide all-pairs context head and the mixed-precision execution in [SPEED.md](SPEED.md).
+It uses chunk reads with a 256 MiB array-cache budget per worker.
+See [README.md](README.md#train-the-hessian-head) for download, CPU preparation, and training commands.

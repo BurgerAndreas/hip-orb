@@ -81,7 +81,7 @@ def training_step(model, optimizer, batch, device="cuda", *, host_sizes=True, lo
                      else torch.stack(model.head(feature)))
         error = predicted - target
         masses = (ATOMIC_MASSES[batch["atomic_numbers"].long()]
-                  if loss_type == "mass_weighted_mse" else None)
+                  if loss_type.startswith("mass_weighted_") else None)
         loss = hessian_error_loss(error, loss_type, masses=masses)
     reference_loss = loss
     consistency = loss.new_zeros(())

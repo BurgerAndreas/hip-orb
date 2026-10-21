@@ -184,7 +184,8 @@ def test_runner_uses_packed_updates_and_resumes(monkeypatch, tmp_path, hessian_b
     monkeypatch.setattr(runner, "make_loader", loader)
     calls = []
 
-    def update(model, optimizer, batch, device, seed, loss_type, *, scaler=None):
+    def update(model, optimizer, batch, device, seed, loss_type, *, scaler=None, loss_scale=1.0):
+        assert loss_scale == 1.0
         calls.append(loss_type)
         return 1.0, len(batch["sizes"])
 
@@ -195,7 +196,7 @@ def test_runner_uses_packed_updates_and_resumes(monkeypatch, tmp_path, hessian_b
     monkeypatch.setattr(runner, "validate", lambda *a: {"validation": {}, "validation_samples": 10})
     out = tmp_path / "out"
     config_path = tmp_path / "config.json"
-    config_path.write_text(json.dumps({"max_hessian_elements": hessian_budget}))
+    config_path.write_text(json.dumps({"max_hessian_elements": hessian_budget, "loss_scale": 1.0}))
     argv = [
         "train",
         "--config",
@@ -221,6 +222,7 @@ def test_runner_uses_packed_updates_and_resumes(monkeypatch, tmp_path, hessian_b
     runner.main()
     saved = torch.load(out / "head.pt", weights_only=True)
     assert saved["global_step"] == 1
+    assert saved["loss_scale"] == 1.0
     assert saved["batching_config"]["mode"] == "balanced"
     assert isinstance(settings_seen[1]["batch_sampler"], BalancedBatchSampler)
     assert "batch_sampler" not in settings_seen[0]  # Validation stays equal-size.

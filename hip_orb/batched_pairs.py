@@ -1,7 +1,31 @@
 """Cached within-molecule pair indices and dynamic message-edge lookup."""
+from functools import lru_cache
+
 import torch
 
 from hip_orb.block_layout import layout, require
+
+
+@lru_cache(maxsize=8)
+def dense_node_metadata(sizes, device):
+    """Store offsets for canonical, sender-major directed molecular edges."""
+    node_offsets, edge_offsets, widths = [], [], []
+    node_start = edge_start = 0
+    for n in sizes:
+        node_offsets.extend([node_start] * n)
+        edge_offsets.extend([edge_start] * n)
+        widths.extend([n] * n)
+        node_start += n
+        edge_start += n * (n - 1)
+    return tuple(torch.tensor(v, device=device, dtype=torch.long)
+                 for v in (node_offsets, edge_offsets, widths))
+
+
+def dense_edge_slots(sizes, senders, receivers):
+    """Map valid nonself edges into the canonical dense edge array."""
+    origin, edge_origin, width = dense_node_metadata(tuple(sizes), str(senders.device))
+    a, b = senders - origin[senders], receivers - origin[senders]
+    return edge_origin[senders] + a * (width[senders] - 1) + b - (b > a).long()
 
 
 def batch_topology(features):
@@ -27,6 +51,9 @@ def batch_topology(features):
         require(((provided_i == i) & (provided_j == j)).all(),
                 "Batched blocks require canonical pair indices")
         fwd, rev = torch.cat(forward), torch.cat(reverse)
+    elif getattr(features, "dense_ordered", False):
+        fwd = dense_edge_slots(sizes, i, j)
+        rev = dense_edge_slots(sizes, j, i)
     else:
         node_owner = indices["node_owner"]
         require((node_owner[features.senders] == node_owner[features.receivers]).all(),

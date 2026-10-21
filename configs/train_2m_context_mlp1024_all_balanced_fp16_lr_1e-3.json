@@ -49,5 +49,17 @@
   "linear_input_alignment": 16,
   "radial_only_backward": true,
   "fused_optimizer": true,
-  "packed_loss_implementation": "pairs"
+  "packed_loss_implementation": "pairs",
+  "head_input_fusion": "both",
+  "precision_overrides": {
+    "head.pair_update.*": {
+      "dtype": "fp32"
+    },
+    "head.node_head.[02]": {
+      "dtype": "fp32"
+    },
+    "head.node_update.*": {
+      "dtype": "fp32"
+    }
+  }
 }

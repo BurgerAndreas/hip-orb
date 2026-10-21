@@ -29,7 +29,9 @@ def head_options(config):
     names = ("hidden", "radial_features", "radial_cutoff", "radial_bases",
              "pair_residual_layers", "neighbor_pooling", "extra_orb_round",
              "translation_projection", "context_rounds", "mlp_hidden", "all_to_all",
-             "orb_initialization", "orb_message_graph")
+             "orb_initialization", "orb_message_graph", "orb_rounds", "orb_combine_backbone_edges",
+             "orb_feature_adapters", "radial_log_range", "shared_geometry", "backbone_layer_mix",
+             "checkpoint_context")
     options = {name: config[name] for name in names if name in config}
     options["cutoff"] = config.get("hessian_cutoff")
     return options

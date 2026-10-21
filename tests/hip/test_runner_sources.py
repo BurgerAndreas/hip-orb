@@ -139,3 +139,128 @@ def test_mixed_precision_requires_cuda_packed_training(monkeypatch, tmp_path, ba
     with pytest.raises(SystemExit) as error:
         runner.main()
     assert error.value.code == 2
+
+
+def test_nonfinite_packed_loss_saves_resumable_state_and_batch(monkeypatch, tmp_path):
+    import torch
+
+    training = index(tmp_path / 'train.npz', tmp_path / 'train.h5', 'training')
+    validation = index(tmp_path / 'val.npz', tmp_path / 'val.h5', 'validation')
+
+    class Model:
+        def __init__(self):
+            self.base = torch.nn.Linear(1, 1)
+            self.head = torch.nn.Linear(1, 1)
+            self.head.config = {}
+
+        def train(self):
+            pass
+
+    class Sampler:
+        fingerprint = 'test-plan'
+
+        def __init__(self, *args, **kwargs):
+            self.settings = {'test': True}
+
+        def __len__(self):
+            return 1
+
+        def set_epoch(self, epoch):
+            pass
+
+    batch = {'sizes': torch.tensor([2]), 'omol_index': torch.tensor([123])}
+
+    class Loader:
+        batch_sampler = Sampler()
+
+        def __iter__(self):
+            return iter([batch])
+
+    def fail(*args, **kwargs):
+        raise FloatingPointError('Packed training loss is not finite')
+
+    monkeypatch.setattr(runner.HIPOrb, 'pretrained', lambda *a, **k: Model())
+    monkeypatch.setattr(runner, 'configure_execution', lambda *a: {})
+    monkeypatch.setattr(runner, 'BalancedBatchSampler', Sampler)
+    monkeypatch.setattr(runner, 'make_loader', lambda *a, **k: Loader())
+    monkeypatch.setattr(runner, 'packed_update', fail)
+    output = tmp_path / 'output'
+    monkeypatch.setattr(sys, 'argv', ['train', '--train-index', str(training),
+        '--validation-index', str(validation), '--output', str(output),
+        '--device', 'cpu', '--batching', 'balanced', '--loss-type', 'block_rmse', '--max-steps', '2'])
+    with pytest.raises(FloatingPointError, match='not finite'):
+        runner.main()
+    checkpoint = torch.load(output / 'head.pt', weights_only=True)
+    failed = torch.load(output / 'nonfinite_batch.pt', weights_only=True)
+    assert checkpoint['global_step'] == checkpoint['epoch_batches'] == 0
+    assert checkpoint['optimizer']['state'] == {}
+    assert failed['global_step'] == 0 and failed['seed'] == 7
+    torch.testing.assert_close(failed['batch']['omol_index'], batch['omol_index'])
+
+
+def test_throughput_includes_work_outside_update(monkeypatch, tmp_path, capsys):
+    import json
+
+    import torch
+
+    training = index(tmp_path / 'train.npz', tmp_path / 'train.h5', 'training')
+    validation = index(tmp_path / 'val.npz', tmp_path / 'val.h5', 'validation')
+    clock = [0.0]
+    monkeypatch.setattr(runner.time, 'perf_counter', lambda: clock[0])
+
+    class Model:
+        def __init__(self):
+            self.base = torch.nn.Linear(1, 1)
+            self.head = torch.nn.Linear(1, 1)
+            self.head.config = {}
+
+        def train(self):
+            pass
+
+    class Loader:
+        batch_sampler = type('Sampler', (), {'set_epoch': lambda *a: None})()
+
+        def __iter__(self):
+            return iter([{'coords': [0, 0]}])
+
+    def lr(*args):
+        clock[0] += 2.0
+        return 0.001
+
+    def step(*args, **kwargs):
+        clock[0] += 1.0
+        return 1.0
+
+    monkeypatch.setattr(runner.HIPOrb, 'pretrained', lambda *a, **k: Model())
+    monkeypatch.setattr(runner, 'configure_execution', lambda *a: {})
+    monkeypatch.setattr(runner, 'make_loader', lambda *a, **k: Loader())
+    monkeypatch.setattr(runner, 'prepare_batch', lambda batch, **k: batch)
+    monkeypatch.setattr(runner, 'training_step', step)
+    monkeypatch.setattr(runner, 'learning_rate', lr)
+    monkeypatch.setattr(runner, 'validate', lambda *a: {'validation': {}, 'validation_samples': 0})
+    monkeypatch.setattr(sys, 'argv', ['train', '--train-index', str(training),
+        '--validation-index', str(validation), '--output', str(tmp_path / 'out'),
+        '--device', 'cpu', '--max-steps', '1'])
+    runner.main()
+    rows = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith('{')]
+    row = next(r for r in rows if 'updates_per_second' in r)
+    assert row['updates_per_second'] == pytest.approx(1 / 3)
+    assert row['geometries_per_second'] == pytest.approx(2 / 3)
+
+
+def test_zero_regularization_overrides_loaded_optimizer_settings_and_dropout():
+    import torch
+    from types import SimpleNamespace
+    base = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Dropout(0.3))
+    head = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Dropout(0.4))
+    optimizer = torch.optim.AdamW(head.parameters(), weight_decay=0.2)
+    loaded = optimizer.state_dict()
+    loaded['param_groups'][0]['weight_decay'] = 0.7
+    optimizer.load_state_dict(loaded)
+    settings = runner.enforce_zero_regularization(SimpleNamespace(base=base, head=head), optimizer)
+    assert settings == {'weight_decay': 0.0, 'dropout': 0.0}
+    assert all(group['weight_decay'] == 0 for group in optimizer.param_groups)
+    assert base[1].p == head[1].p == 0
+    head.train()
+    x = torch.randn(8, 2)
+    torch.testing.assert_close(head(x), head(x), atol=0, rtol=0)

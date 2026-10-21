@@ -1,13 +1,14 @@
 """Opt-in packed molecular training. Live equal-size training stays unchanged."""
 
 import hashlib
+import math
 from functools import lru_cache
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
-from hip_orb.block_layout import layout, require
+from hip_orb.block_layout import layout
 from hip_orb.graphs import canonical_message_graph, refresh_message_vectors
 
 
@@ -213,10 +214,15 @@ def packed_blocks(model, feature, indices, sizes):
     return blocks
 
 
-def packed_loss(blocks, target, indices, loss_type="block_rmse"):
+def packed_loss(blocks, target, indices, loss_type="block_rmse", masses=None):
     error = blocks - target
-    if loss_type == "block_rmse":
+    if loss_type in ("block_rmse", "mass_weighted_block_rmse"):
         values = torch.linalg.vector_norm(error, dim=(1, 2)) / 3
+        if loss_type == "mass_weighted_block_rmse":
+            if masses is None:
+                raise ValueError("Mass-weighted block RMSE requires atomic masses")
+            inv = masses.to(error).rsqrt()
+            values = values * inv[indices["block_row"]] * inv[indices["block_col"]]
     elif loss_type == "mse":
         values = error.square().mean((1, 2))
     elif loss_type == "mae":
@@ -226,14 +232,20 @@ def packed_loss(blocks, target, indices, loss_type="block_rmse"):
     return (values * indices["block_weight"]).sum()
 
 
-def packed_update(model, optimizer, batch, device="cuda", seed=7, loss_type="block_rmse", *, scaler=None):
+@lru_cache(maxsize=8)
+def atomic_mass_table(device):
+    from ase.data import atomic_masses
+    return torch.tensor(atomic_masses.copy(), dtype=torch.float32, device=device)
+
+
+def packed_update(model, optimizer, batch, device="cuda", seed=7, loss_type="block_rmse", *, scaler=None,
+                  loss_scale=1.0):
     with torch.profiler.record_function("packed_prepare"):
         batch = prepare_packed(batch, seed)
     with torch.profiler.record_function("packed_graph_and_indices"):
         graph = packed_graph(batch, model.adapter, device)
         compact = (getattr(model, "_compact_pair_loss", False)
-                   and not model.head.translation_projection
-                   and not hasattr(model.head, "orb_distance_encoder"))
+                   and not model.head.translation_projection)
         if compact:
             indices = compact_indices(tuple(batch["sizes"].tolist()), str(device))
         elif "indices" in batch:
@@ -250,16 +262,23 @@ def packed_update(model, optimizer, batch, device="cuda", seed=7, loss_type="blo
     with torch.profiler.record_function("packed_head_and_loss"):
         upper = batch["hessian_upper"].to(device, non_blocking=True)
         r = batch["rotation"].to(device, non_blocking=True)
+        masses = (atomic_mass_table(str(device))[batch["atomic_numbers"].to(device).long()]
+                  if loss_type == "mass_weighted_block_rmse" else None)
         if compact:
             feature.packed_layout = indices
             blocks, diagonal = model.head._batched_forward(feature, as_tensor="pair-blocks")
-            loss = compact_loss(blocks, diagonal, upper, r, indices, loss_type)
+            loss = compact_loss(blocks, diagonal, upper, r, indices, loss_type, masses)
         else:
             target = upper[indices["upper_ids"]].reshape(-1, 3, 3)
             target = r @ target @ r.T
             blocks = packed_blocks(model, feature, indices, batch["sizes"])
-            loss = packed_loss(blocks, target, indices, loss_type)
-    require(torch.isfinite(loss), "Packed training loss is not finite")
+            loss = packed_loss(blocks, target, indices, loss_type, masses)
+        loss = loss * loss_scale
+    # Check before backward without poisoning CUDA with a device-side assertion.
+    # The runner can then save the last valid optimizer state and failing batch.
+    loss_value = float(loss.detach())
+    if not math.isfinite(loss_value):
+        raise FloatingPointError("Packed training loss is not finite")
     with torch.profiler.record_function("packed_backward_and_optimizer"):
         optimizer.zero_grad(set_to_none=True)
         if scaler is None:
@@ -275,7 +294,7 @@ def packed_update(model, optimizer, batch, device="cuda", seed=7, loss_type="blo
             scaler.update()
         from hip_orb.mixed_precision import invalidate_trainable_precision_caches
         invalidate_trainable_precision_caches(model)
-    return float(loss.detach()), len(batch["sizes"])
+    return loss_value, len(batch["sizes"])
 
 
 def collate_packed_compact(samples):
@@ -404,13 +423,15 @@ def compact_indices(values, device):
             "diag_weight": 1.0 / (len(values) * sizes[node_owner].float().square())}
 
 
-def compact_loss(blocks, diagonal, upper, rotation, indices, loss_type="block_rmse"):
+def compact_loss(blocks, diagonal, upper, rotation, indices, loss_type="block_rmse", masses=None):
     """Weight symmetric off-diagonal blocks twice and diagonal blocks once."""
-    def terms(prediction, ids, weights):
+    def terms(prediction, ids, weights, mass_weights=None):
         target = rotation @ upper[ids] @ rotation.T
         error = prediction - target
-        if loss_type == "block_rmse":
+        if loss_type in ("block_rmse", "mass_weighted_block_rmse"):
             values = torch.linalg.vector_norm(error, dim=(1, 2)) / 3
+            if loss_type == "mass_weighted_block_rmse":
+                values = values * mass_weights
         elif loss_type == "mse":
             values = error.square().mean((1, 2))
         elif loss_type == "mae":
@@ -418,5 +439,11 @@ def compact_loss(blocks, diagonal, upper, rotation, indices, loss_type="block_rm
         else:
             raise ValueError("Compact loss supports block_rmse, mse, and mae")
         return (values * weights).sum()
-    return terms(blocks, indices["pair_upper"], indices["pair_weight"]) + terms(
-        diagonal, indices["diag_upper"], indices["diag_weight"])
+    pair_mass, diag_mass = None, None
+    if loss_type == "mass_weighted_block_rmse":
+        if masses is None:
+            raise ValueError("Mass-weighted block RMSE requires atomic masses")
+        inv = masses.to(blocks).rsqrt()
+        pair_mass, diag_mass = inv[indices["i"]] * inv[indices["j"]], inv.square()
+    return terms(blocks, indices["pair_upper"], indices["pair_weight"], pair_mass) + terms(
+        diagonal, indices["diag_upper"], indices["diag_weight"], diag_mass)

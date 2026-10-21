@@ -93,17 +93,22 @@ Use `scripts/hip_train.sbatch` for both runs. Set `HIP_TRAIN_CONFIG` in `.env` t
 `configs/smoke_pilot.json` sets batch size 128, 64 updates, and three validation batches.
 It also checks validation every 32 updates. The runner always performs final validation.
 `configs/train.json` selects the context head as the default baseline.
-It uses width 256, internal MLP width 256, one context round, two residual pair layers, and neighbor pooling.
-It uses 16 independent Bessel radial features with a 12 Å envelope and the frozen Orb backbone.
+It uses width 256, internal MLP width 1024, one context round, two residual pair layers, and neighbor pooling.
+It uses a fully connected Hessian graph and a frozen Orb backbone.
+Sixteen independent Bessel features and log distance use a separate 12 Å radial scale.
 Training uses single-view corrected rotations, Block RMSE, and 2,000,000 optimizer updates without an overall duration limit.
 The learning rate rises linearly to 0.001 over 300,000 updates, then follows cosine decay to zero.
 The older loss-comparison configurations retain their explicit 1,000,000-update budgets and simpler heads.
 The schedule uses the absolute update number and retains its position across job restarts.
 Validation runs every 200,000 updates and at the end, using at most 10,000 geometries each time.
 The fixed seed selects the same validation geometries for each check.
-New training uses balanced packed batches, with a maximum of 64 geometries and 2,560 atoms.
+New training uses balanced packed batches, with a maximum of 64 geometries and 1,792 atoms.
 It has no Hessian-element cap. Shard windows preserve source-file locality between updates.
-Four loader workers use persistent processes, prefetch four batches each, and cache up to 1 GiB each.
+Four persistent loader workers prefetch four batches each and read HDF5 chunks with sixteen open files each.
+The default uses the FP32 precision policy and verified selective FP16 kernels.
+Mixture forwards stay in FP32. The combined head also keeps activation gradients in FP32.
+Fused AdamW and the selected kernels follow the settings in [SPEED.md](SPEED.md).
+Use the original configuration to resume an existing run.
 Set `HIP_SLURM_CPUS_PER_TASK=8` in `.env` for this loader configuration.
 Validation retains equal-size batches, with a maximum of 256 geometries and an eight-million-element Hessian budget.
 Historical comparison configurations retain their recorded batch limits.
@@ -111,7 +116,7 @@ The short-session experiments use two-hour jobs and checkpoint after 25,000 upda
 Set `HIP_SLURM_PARTITION` and optional `HIP_SLURM_TIME_LIMIT` in the private environment for these submissions.
 Training continuations inherit the actual Slurm partition if a pending job moves partitions.
 Use `scripts/hip_train_steps.sbatch` on clusters with four-hour GPU limits.
-The default baseline checkpoints after 50,000 updates or three hours and submits one successor if training remains incomplete.
+The default checkpoints after 25,000 updates or 90 minutes and submits one successor if training remains incomplete.
 Other configurations retain their specified session limits.
 Only the last job performs final validation. Failed jobs do not submit successors.
 Submit from the repository root, with the training environment and selected configuration.
@@ -235,3 +240,108 @@ For controlled updates, set `HIP_TRAIN_RUNTIME_POINTER` to a private file such a
 Its first line contains the complete snapshot directory.
 The launcher reads it on each allocation, so the next continuation selects the verified snapshot.
 Update this pointer atomically after all checks pass. Existing allocations retain their imported code.
+
+
+### Balanced Orb extension experiments
+
+The following configurations use fresh, randomly initialized Orb processors.
+They keep the pretrained backbone frozen and assemble all Hessian pairs.
+Feature width is 256; Hessian-head internal MLP width is 1024.
+All three use FP32, one uniform rotation per update, and no consistency loss.
+They use balanced batches with at most 64 structures and 1792 atoms, without a Hessian element cap.
+The loader uses four workers, chunk caching, locality ordering, and four prefetched batches per worker.
+The training target is two million successful updates, with cosine decay and 15% linear warm-up.
+Periodic and final validation use 10,000 geometries, with a batch-size limit of 256.
+
+- `train_2m_orb2_backbone_balanced_lr_1e-3.json` adds two independent Orb processors on the backbone graph.
+- `train_2m_orb_dense_combined_balanced_lr_1e-3.json` adds one dense processor with learned backbone-edge residuals.
+- `train_2m_orb_backbone_mass_block_balanced_lr_1e-3.json` uses one backbone-graph processor and mass-weighted Block RMSE.
+
+`orb_rounds` controls extension depth. Each round has independent trainable parameters.
+`orb_combine_backbone_edges` requires the dense extension.
+Its separate radial/angular encoder supplies every directed dense edge.
+A learned projection adds RMS-normalized pretrained edge features where matching backbone edges exist.
+Other dense edges receive no pretrained residual. The frozen backbone retains its original graph.
+
+`mass_weighted_block_rmse` weights each atom-pair Frobenius norm by `1 / sqrt(m_i m_j)`.
+It averages blocks within each geometry, then averages geometries equally.
+It preserves rotation invariance and finite zero-error gradients.
+Packed and compact implementations preserve symmetric off-diagonal multiplicity.
+`loss_scale` is a fixed positive multiplier for packed loss values and gradients.
+A calibrated experiment records its multiplier in its configuration, report, and checkpoint.
+Raw losses require division by this multiplier. Losses from different objectives are not directly comparable.
+The mass-weighted experiment uses a fixed multiplier of 2.2283616895635414.
+It matches the mean initial global gradient norm across eight training batches.
+
+### Dense feature-adapter and pair-width experiments
+
+Six `train_2m_dense_*_balanced_lr_1e-3.json` configurations isolate feature adapters and pair width.
+They share one randomly initialized dense Orb round, FP32, Block RMSE, and the same balanced batch settings.
+The control uses feature width 256 and internal MLP width 1024.
+The `pair512` variants increase the Hessian pair representation to 512; Orb features remain width 256.
+All runs use fresh heads, two million updates, and the existing cosine schedule.
+The original atom embeddings, backbone, charge predictor, and conditioner remain frozen.
+
+`orb_feature_adapters` selects `none`, `atom`, `edge`, or `both` before the extra Orb round.
+Atom adapters combine normalized Orb node features, a fresh 64-channel element embedding, and frozen predicted charge.
+Edge adapters combine normalized edge features, fresh endpoint element embeddings, and separate radial/angular geometry features.
+The edge radial basis has trainable frequencies and no hard cutoff in these dense experiments.
+Each adapter uses internal MLP width 1024 and adds a residual in the original 256-channel feature space.
+Small output weights initialize the residual near zero.
+Edge-adapter variants also retain pretrained features on matching backbone edges through the learned edge residual.
+Edge adapters use non-reentrant activation checkpointing during training to reduce memory.
+This recomputes the adapter during backward without changing its forward values or gradients.
+
+The experiments are control, atom adapter, edge adapter, both adapters, pair width 512, and both adapters with width 512.
+These Cartesian readouts do not guarantee exact rotation equivariance.
+
+The trainer enforces weight decay zero and dropout zero after loading optimizer checkpoints.
+Reports and checkpoints record `regularization_config`.
+
+### Nonperiodic distance features and structural comparisons
+
+`radial_features: log_gaussian` replaces the expanded Bessel basis in the trainable Hessian extension.
+The frozen Orb backbone retains its pretrained radial features and graph.
+The new basis contains 14 Gaussian functions of log distance, one constant, and one smooth inverse distance.
+A separate log-distance channel keeps the readout input at 17 distance features.
+The radial-angular outer product plus log distance retains 257 input features.
+There is no finite support boundary and no common zero at 12 Angstrom.
+Gaussian centers and positive widths train independently.
+A bounded training-only calibration initializes `radial_log_range`; validation geometries do not enter calibration.
+The reference length for log and inverse distance is one Angstrom.
+
+The seven `train_2m_smooth_*_balanced_lr_1e-3.json` configurations share the new basis and training settings.
+The existing dense Bessel control remains a historical comparator.
+
+- `radial` changes only the trainable radial encoding relative to the dense control.
+- `edge_reuse` adds pretrained backbone edge features as a matched control for layer mixing.
+- `context` adds one readout context round after the extra dense Orb round.
+- `shared` computes one trainable radial-angular geometry encoding for dense messages and pair readout.
+- `layer_mix` learns separate mixtures of the last three frozen node and edge layers.
+- `translation` applies the existing translation projection to the assembled Hessian.
+- `combined` enables context, shared geometry, layer mixing, and translation projection together.
+
+Shared geometry uses separate learned projections for message initialization and pair-readout geometry channels.
+The shared encoding is computed once per forward pass and retains both gradient paths.
+It is not a persistent feature cache.
+Layer mixtures normalize each captured layer and learn softmax weights, initially favoring the final layer.
+Charges remain predictions from the original final backbone features.
+Dense layer-mixture experiments retain mixed backbone edge features through the learned edge residual.
+Temporary hooks are removed after each frozen backbone forward, including failed forwards.
+
+`checkpoint_context` recomputes context MLP activations during backward to reduce memory.
+It preserves forward values and gradients.
+All experiments keep pair width 256, internal MLP width 1024, FP32, zero weight decay, and zero dropout.
+They retain balanced batches, one uniform rotation, Block RMSE, and the two-million-step cosine schedule.
+These readouts do not guarantee exact rotation equivariance.
+
+The recorded calibration samples 2,048 training geometries and 786,563 atom pairs.
+The largest sampled distance is 83.50 Angstrom; the initial center range extends to 104.49 Angstrom.
+This range initializes centers; it does not truncate features or edges.
+
+Translation-projection experiments select `packed_loss_implementation: dense`.
+The independent-pair loss path does not support translation projection in the runner.
+
+`radial_cutoff` remains a legacy configuration field for checkpoint compatibility.
+For `log_gaussian` on all-to-all graphs, it does not truncate distances or set Gaussian centers.
+`radial_log_range` controls the initial log-distance centers instead.

@@ -2,7 +2,7 @@
 
 import torch
 
-LOSS_TYPES = ("mse", "mae", "block_rmse", "mass_weighted_mse")
+LOSS_TYPES = ("mse", "mae", "block_rmse", "mass_weighted_mse", "mass_weighted_block_rmse")
 
 
 def rotate_hessian(matrix, rotation):
@@ -32,7 +32,7 @@ def hessian_error_loss(error, loss_type="mse", masses=None):
         return error.square().mean()
     if loss_type == "mae":
         return error.abs().mean()
-    if loss_type == "mass_weighted_mse":
+    if loss_type in ("mass_weighted_mse", "mass_weighted_block_rmse"):
         if (error.ndim != 3 or error.shape[-1] != error.shape[-2]
                 or error.shape[-1] % 3 or masses is None
                 or masses.shape != (error.shape[0], error.shape[-1] // 3)):
@@ -40,7 +40,9 @@ def hessian_error_loss(error, loss_type="mse", masses=None):
         weights = masses.to(device=error.device, dtype=error.dtype).rsqrt().repeat_interleave(3, dim=-1)
         # Weight the difference, which equals the difference of weighted Hessians.
         weighted_error = error * weights[:, :, None] * weights[:, None, :]
-        return weighted_error.square().mean()
+        if loss_type == "mass_weighted_mse":
+            return weighted_error.square().mean()
+        return hessian_error_loss(weighted_error, "block_rmse")
     if loss_type != "block_rmse":
         raise ValueError(f"Hessian loss must be one of {LOSS_TYPES}")
     if error.ndim != 3 or error.shape[-1] != error.shape[-2] or error.shape[-1] % 3:

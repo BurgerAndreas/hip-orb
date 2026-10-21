@@ -103,7 +103,7 @@ def _silu_backward(
     cols = tl.program_id(1) * CN + tl.arange(0, CN)
     ids = rows[:, None] * N + cols[None, :]
     mask = (rows[:, None] < M) & (cols[None, :] < N)
-    z = tl.load(P + ids, mask, 0)
+    z = tl.load(P + ids, mask, 0).to(tl.float32)
     if BIAS:
         z += tl.load(B + cols, cols < N, 0)[None, :]
     g = tl.load(G + ids, mask, 0).to(tl.float32)
@@ -117,23 +117,22 @@ def _silu_backward(
 
 class _FusedHalfSiLU(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, bias, half_output, cached_weight, input_grad_columns):
+    def forward(ctx, x, weight, bias, half_output, cached_weight, input_grad_columns, fused_input_cast, radial_source):
         ctx.shape = x.shape
         ctx.input_grad_columns = input_grad_columns
-        a = x.reshape(-1, x.shape[-1]).half()
+        ctx.radial_dtype = None if radial_source is None else radial_source.dtype
         w = weight.half() if cached_weight is None else cached_weight
-        if a.shape[1] != w.shape[1]:
-            a = torch.nn.functional.pad(a, (0, w.shape[1] - a.shape[1]))
+        if fused_input_cast:
+            from hip_orb.head_fusion import cast_half_padded
+            a = cast_half_padded(x.reshape(-1, x.shape[-1]), w.shape[1])
+        else:
+            a = x.reshape(-1, x.shape[-1]).half()
+            if a.shape[1] != w.shape[1]:
+                a = torch.nn.functional.pad(a, (0, w.shape[1] - a.shape[1]))
         pre = torch.mm(a, w.T, out_dtype=torch.float32)
         y = torch.empty_like(pre, dtype=torch.float16 if half_output else torch.float32)
         _silu_forward[(triton.cdiv(y.numel(), 1024),)](
-            pre,
-            bias,
-            y,
-            y.numel(),
-            y.shape[1],
-            bias is not None,
-            1024,
+            pre, bias, y, y.numel(), y.shape[1], bias is not None, 1024,
         )
         ctx.save_for_backward(a, w, pre, bias)
         ctx.dtypes = x.dtype, weight.dtype, None if bias is None else bias.dtype
@@ -163,7 +162,11 @@ class _FusedHalfSiLU(torch.autograd.Function):
             32,
             128,
         )
-        dx = None
+        dx = dradial = None
+        if ctx.needs_input_grad[7]:
+            lo, hi = ctx.input_grad_columns
+            selected = torch.nn.functional.pad(w[:, lo:hi], (0, (-(hi - lo)) % 16))
+            dradial = torch.mm(gh, selected, out_dtype=torch.float32)[:, :hi-lo].to(ctx.radial_dtype)
         if ctx.needs_input_grad[0]:
             if ctx.input_grad_columns is None:
                 dx = torch.mm(gh, w, out_dtype=torch.float32)[:, :ctx.shape[-1]].reshape(ctx.shape).to(ctx.dtypes[0])
@@ -180,13 +183,22 @@ class _FusedHalfSiLU(torch.autograd.Function):
             else None
         )
         db = partial.sum(0).to(ctx.dtypes[2]) if ctx.needs_input_grad[2] else None
-        return dx, dw, db, None, None, None
+        return dx, dw, db, None, None, None, None, dradial
 
 
-def fused_half_silu(x, weight, bias=None, *, half_output=False, cache=None, alignment=1, input_grad_columns=None):
+def fused_half_silu(x, weight, bias=None, *, half_output=False, cache=None, alignment=1, input_grad_columns=None,
+                    fused_input_cast=False, radial_source=None):
+    """Use a direct radial input only for matching columns of detached x."""
     from hip_orb.mixed_precision import cached_half_weight
 
+    if radial_source is not None and (
+            input_grad_columns is None or x.requires_grad
+            or radial_source.shape != (x.numel() // x.shape[-1], input_grad_columns[1] - input_grad_columns[0])):
+        raise ValueError("Direct radial backward requires detached inputs and matching radial columns")
     if not x.numel():
+        # Preserve a zero connection to the trainable radial input for empty pair sets.
+        if radial_source is not None:
+            x = x + radial_source.sum() * 0
         y = torch.nn.functional.silu(
             torch.nn.functional.linear(
                 x.float(),
@@ -196,5 +208,6 @@ def fused_half_silu(x, weight, bias=None, *, half_output=False, cache=None, alig
         )
         return y.half() if half_output else y
     return _FusedHalfSiLU.apply(
-        x, weight, bias, half_output, cached_half_weight(weight, torch.float16, cache, alignment), input_grad_columns
+        x, weight, bias, half_output, cached_half_weight(weight, torch.float16, cache, alignment),
+        input_grad_columns, fused_input_cast, radial_source
     )

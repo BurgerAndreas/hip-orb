@@ -50,3 +50,67 @@ def hessian_metrics(predicted, target, positions, masses):
         negative_modes_target=int((te < -1e-6).sum()),
     )
     return output
+
+
+def rotate_hessians(hessians, rotation):
+    """Rotate atom-pair blocks without a dense Kronecker matrix."""
+    if hessians.shape[-1] != hessians.shape[-2] or hessians.shape[-1] % 3:
+        raise ValueError('Hessians require square dimensions divisible by three')
+    if (hessians.is_cuda and hessians.dtype == torch.float32 and hessians.is_contiguous()
+            and rotation.shape == (3, 3)
+            and rotation.device == hessians.device and rotation.dtype == hessians.dtype
+            and not (torch.is_grad_enabled() and (hessians.requires_grad or rotation.requires_grad))):
+        from hip_orb.block_rotation import rotate_blocks
+        return rotate_blocks(hessians, rotation.contiguous())
+    n = hessians.shape[-1] // 3
+    blocks = hessians.reshape(*hessians.shape[:-2], n, 3, n, 3).movedim(-3, -2)
+    r = rotation[..., None, None, :, :]
+    result = r @ blocks @ r.transpose(-1, -2)
+    return result.movedim(-2, -3).reshape_as(hessians)
+
+
+def batched_hessian_metrics(predicted, target, positions, masses):
+    """Evaluate equal-size molecules with batched decompositions."""
+    if not len(predicted):
+        return []
+    error = predicted - target
+    rmse = error.square().mean((-2, -1)).sqrt()
+    basic = torch.stack((error.abs().mean((-2, -1)), rmse,
+                         rmse / target.square().mean((-2, -1)).sqrt().clamp_min(1e-12)), -1)
+    # Keep each original SVD and projection. Batched projections select different
+    # TF32 algorithms and can change nearly degenerate mode statistics.
+    bases = [vibrational_basis(x, m) for x, m in zip(positions, masses, strict=True)]
+    ranks = [predicted.shape[-1] - basis.shape[-1] for basis in bases]
+    rows = [dict(zip(('mae', 'rmse', 'relative_rmse'), values, strict=True))
+            for values in basic.cpu().tolist()]
+    weights = masses.repeat_interleave(3, dim=-1).rsqrt()
+    for rank in sorted(set(ranks)):
+        if rank == predicted.shape[-1]:
+            continue
+        ids = [i for i, value in enumerate(ranks) if value == rank]
+        def reduced(h, i):
+            basis, inv = bases[i], weights[i]
+            return basis.T @ (h * inv[:, None] * inv[None, :]) @ basis
+        p = torch.stack([reduced(predicted[i], i) for i in ids])
+        t = torch.stack([reduced(target[i], i) for i in ids])
+        values, vectors = torch.linalg.eigh(torch.cat((p, t)))
+        pe, te = values.chunk(2)
+        pv, tv = vectors.chunk(2)
+        k = min(3, te.shape[-1])
+        cosine = (pv[..., 0] * tv[..., 0]).sum(-1)
+        # Preserve the scalar dot-product algorithm for this sensitive statistic.
+        cross = torch.stack([a[:, :k].T @ b[:, :k]
+                             for a, b in zip(pv, tv, strict=True)])
+        overlap = cross.square().sum((-2, -1)) / k
+        metrics = torch.stack(((p - t).abs().mean((-2, -1)),
+                               (pe - te).abs().mean(-1), cosine.abs(), cosine.square(),
+                               overlap, (pe < -1e-6).sum(-1), (te < -1e-6).sum(-1)), -1)
+        keys = ('vibrational_mae', 'eigenvalue_mae', 'first_mode_abs_cosine',
+                'first_mode_overlap', 'low_subspace_overlap',
+                'negative_modes_predicted', 'negative_modes_target')
+        for i, values in zip(ids, metrics.cpu().tolist(), strict=True):
+            row = dict(zip(keys, values, strict=True))
+            for key in keys[-2:]:
+                row[key] = int(row[key])
+            rows[i].update(row)
+    return rows

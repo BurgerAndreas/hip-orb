@@ -26,6 +26,7 @@ class LinearPolicy:
     fuse_silu: bool = False
     activation_dtype: str = "fp32"
     input_alignment: int = 1
+    fused_input_cast: bool = False
 
 
 def quantize_fp8(value, dtype=torch.float8_e4m3fn):
@@ -181,18 +182,22 @@ def fp8_linear(x, weight, bias=None, *, backward="bf16", cache=None):
 
 
 @contextmanager
-def linear_precision(model, *, head=LinearPolicy(), backbone=LinearPolicy(), include_outputs=False):
+def linear_precision(model, *, head=LinearPolicy(), backbone=LinearPolicy(), include_outputs=False,
+                     overrides=None):
     """Temporarily replace linear forwards without changing parameters or state keys.
 
     The backbone selection covers base.model. The charge head, geometry,
     Coulomb correction, pooling, normalization, and losses keep their own dtype.
     """
     changed = []
+    overrides = dict(overrides or {})
+    matched = set()
     previous_caches = getattr(model, "_hip_precision_trainable_caches", None)
     model._hip_precision_trainable_caches = list(previous_caches or ())
     stats = {
         "head_layers": [],
         "backbone_layers": [],
+        "overrides": {},
         "calls": {
             key: 0
             for key in (
@@ -228,9 +233,20 @@ def linear_precision(model, *, head=LinearPolicy(), backbone=LinearPolicy(), inc
             if region is None:
                 continue
             policy = head if region == "head" else backbone
-            if policy.include and not any(fnmatchcase(name, pat) for pat in policy.include):
+            matches = [pat for pat in overrides if fnmatchcase(name, pat)]
+            if len(matches) > 1:
+                raise ValueError(f"Overlapping precision overrides for {name}")
+            explicit = bool(matches)
+            if explicit:
+                pattern = matches[0]
+                matched.add(pattern)
+                policy = overrides[pattern]
+                if not isinstance(policy, LinearPolicy):
+                    raise TypeError("Precision overrides must contain LinearPolicy values")
+                stats["overrides"][name] = policy.dtype
+            if not explicit and policy.include and not any(fnmatchcase(name, pat) for pat in policy.include):
                 continue
-            if any(fnmatchcase(name, pat) for pat in policy.exclude):
+            if not explicit and any(fnmatchcase(name, pat) for pat in policy.exclude):
                 continue
             if policy.selection not in ("all", "square"):
                 raise ValueError("Unknown linear selection")
@@ -241,7 +257,7 @@ def linear_precision(model, *, head=LinearPolicy(), backbone=LinearPolicy(), inc
             if (
                 region == "head"
                 and module.out_features == 9
-                and not include_outputs
+                and not include_outputs and not explicit
                 and head.dtype != "fp32"
                 and (head.output_dtype == "bf16" or head.activation_dtype == "fp16")
             ):
@@ -253,8 +269,19 @@ def linear_precision(model, *, head=LinearPolicy(), backbone=LinearPolicy(), inc
                 module.forward = MethodType(full_output, module)
                 changed.append((module, original, {}))
                 continue
+            if explicit and policy.dtype == "fp32":
+                original = module.forward
+
+                def full_precision(self, x):
+                    return F.linear(x.float(), self.weight, self.bias)
+
+                module.forward = MethodType(full_precision, module)
+                changed.append((module, original, {}))
+                stats[region + "_layers"].append(name)
+                continue
             if policy.dtype == "fp32" or (
                 region == "head" and module.out_features == 9 and not include_outputs
+                and not explicit
             ):
                 continue
             if policy.dtype not in stats["calls"]:
@@ -276,14 +303,17 @@ def linear_precision(model, *, head=LinearPolicy(), backbone=LinearPolicy(), inc
                 if fuse:
                     from hip_orb.precision_kernels import fused_half_silu
 
+                    radial_source = getattr(self, "_hip_radial_source", None)
                     return fused_half_silu(
-                        x,
+                        x.detach() if radial_source is not None else x,
                         self.weight,
                         self.bias,
                         half_output=policy.activation_dtype == "fp16",
                         cache=cache,
                         alignment=policy.input_alignment,
                         input_grad_columns=getattr(self, "_hip_input_grad_columns", None),
+                        fused_input_cast=policy.fused_input_cast,
+                        radial_source=radial_source,
                     )
                 if policy.dtype == "fp8":
                     y = fp8_linear(x, self.weight, self.bias, backward=policy.backward, cache=cache)
@@ -327,6 +357,8 @@ def linear_precision(model, *, head=LinearPolicy(), backbone=LinearPolicy(), inc
             module.forward = MethodType(forward, module)
             changed.append((module, original, cache))
             stats[region + "_layers"].append(name)
+        if set(overrides) != matched:
+            raise ValueError(f"Unmatched precision overrides: {sorted(set(overrides) - matched)}")
         yield stats
     finally:
         for module, original, cache in reversed(changed):

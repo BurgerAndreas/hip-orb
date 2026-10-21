@@ -13,6 +13,7 @@ from hip_orb.batched_pairs import batch_topology
 from hip_orb.block_layout import layout, assemble
 from hip_orb.translation import project_hessian_list
 from hip_orb.translation import project_translations
+from hip_orb.radial import make_radial
 
 
 @dataclass
@@ -27,6 +28,8 @@ class Features:
     constant: float | torch.Tensor = 14.3996
     sigma: float | None = None
     pairs: list[dict[str, torch.Tensor]] | None = None
+    geometry: torch.Tensor | None = None
+    dense_ordered: bool = False
 
 
 def mlp(inputs, hidden, outputs):
@@ -113,14 +116,19 @@ class HessianHead(nn.Module):
     def __init__(self, latent_dim=256, hidden=128, cutoff=None,
                  radial_features="log", radial_cutoff=12.0, radial_bases=16,
                  pair_residual_layers=0, neighbor_pooling=False, translation_projection=False,
-                 context_rounds=1, mlp_hidden=None, all_to_all=False):
+                 context_rounds=1, mlp_hidden=None, all_to_all=False,
+                 radial_log_range=4.0, shared_geometry=False, checkpoint_context=False):
         super().__init__()
         if cutoff is not None and cutoff <= 0:
             raise ValueError("Hessian cutoff must be positive or None")
         if all_to_all and cutoff is not None:
             raise ValueError("All-to-all Hessian graphs cannot have a cutoff")
-        if radial_features not in ("log", "bessel"):
-            raise ValueError("Radial features must be log or bessel")
+        if radial_features not in ("log", "bessel", "log_gaussian"):
+            raise ValueError("Radial features must be log, bessel, or log_gaussian")
+        if radial_features == "log_gaussian" and not all_to_all:
+            raise ValueError("Log Gaussian features require an all-to-all Hessian graph")
+        if shared_geometry and radial_features == "log":
+            raise ValueError("Shared geometry requires an expanded radial basis")
         if radial_cutoff <= 0 or radial_bases < 1:
             raise ValueError("Radial cutoff and basis count must be positive")
         mlp_hidden = hidden if mlp_hidden is None else mlp_hidden
@@ -132,12 +140,20 @@ class HessianHead(nn.Module):
         self.radial_cutoff = float(radial_cutoff)
         self.radial_bases = int(radial_bases)
         self.all_to_all = all_to_all
-        self.radial = (BesselBasis(r_max=self.radial_cutoff, num_bases=self.radial_bases, trainable=all_to_all)
-                       if radial_features == "bessel" else None)
-        radial_dim = self.radial_bases + int(all_to_all) if radial_features == "bessel" else 1
+        self.shared_geometry = shared_geometry
+        self.checkpoint_context = checkpoint_context
+        self.radial = (make_radial(radial_features, self.radial_bases, self.radial_cutoff,
+                                  radial_log_range, trainable=all_to_all)
+                       if radial_features != "log" and not shared_geometry else None)
+        radial_dim = self.radial_bases + int(all_to_all) if radial_features != "log" else 1
         self.config = {"latent_dim": latent_dim, "hidden": hidden, "cutoff": cutoff,
                        "radial_features": radial_features, "radial_cutoff": self.radial_cutoff,
                        "radial_bases": self.radial_bases}
+        if radial_features == "log_gaussian":
+            self.config["radial_log_range"] = radial_log_range
+        if shared_geometry:
+            self.geometry_projection = nn.Linear(latent_dim, radial_dim)
+            self.config["shared_geometry"] = True
         if all_to_all:
             self.config["all_to_all"] = True
         if context_rounds != 1:
@@ -189,6 +205,8 @@ class HessianHead(nn.Module):
         return project_translations(hessians) if self.translation_projection else hessians
 
     def radial_embedding(self, distance):
+        if self.shared_geometry:
+            raise ValueError("Shared geometry must use the cached directed encoder output")
         if self.radial_features_type == "log":
             return torch.log1p(distance.reshape(-1, 1))
         # Use Orb's fixed Bessel form with a separate radius for the Hessian graph.
@@ -203,6 +221,7 @@ class HessianHead(nn.Module):
         sizes, i, j, forward, reverse, delta, distance = batch_topology(features)
         charges = features.charges.reshape(-1)
         self.pair_adapter[0]._hip_input_grad_columns = None
+        self.pair_adapter[0]._hip_radial_source = None
         if (getattr(self, "_radial_only_backward", False) and self.all_to_all
                 and self.radial_features_type == "bessel"
                 and not any(t.requires_grad for t in (features.nodes, features.edges,
@@ -211,6 +230,15 @@ class HessianHead(nn.Module):
             self.pair_adapter[0]._hip_input_grad_columns = (start, start + self.radial_bases + 1)
 
         def inputs(a, b, ids, direction, radii):
+            if (getattr(self, "_fused_pair_inputs", False) and features.nodes.is_cuda
+                    and not any(t.requires_grad for t in (features.nodes, features.edges, charges, direction))
+                    and all(t.is_contiguous() and t.dtype == torch.float32
+                            for t in (features.nodes, features.edges, charges, radii))):
+                from hip_orb.head_fusion import frozen_pair_inputs
+                if self.pair_adapter[0]._hip_input_grad_columns is not None:
+                    self.pair_adapter[0]._hip_radial_source = radii
+                return frozen_pair_inputs(features.nodes, features.edges, charges,
+                                          a, b, ids, direction.contiguous(), radii)
             present = ids >= 0
             if hasattr(self, "_edge_gather"):
                 edge = self._edge_gather(features.edges, ids)
@@ -228,11 +256,44 @@ class HessianHead(nn.Module):
             first, second = directed.chunk(2) if len(i) else (directed, directed)
         else:
             unit = delta / distance
-            radial = self.radial_embedding(distance)
-            first = self.pair_residual(self.pair_adapter(inputs(i, j, forward, unit, radial)))
-            second = self.pair_residual(self.pair_adapter(inputs(j, i, reverse, -unit, radial)))
+            if self.shared_geometry:
+                if features.geometry is None:
+                    raise ValueError("Shared geometry features are missing")
+                if hasattr(self, "_edge_gather"):
+                    gather = self._edge_gather
+                else:
+                    gather = lambda values, ids: values[ids]
+                if getattr(self, "_project_geometry_first", False) and features.dense_ordered:
+                    projected = self.geometry_projection(features.geometry)
+                    first_radial = gather(projected, forward)
+                    second_radial = gather(projected, reverse)
+                else:
+                    first_radial = self.geometry_projection(gather(features.geometry, forward))
+                    second_radial = self.geometry_projection(gather(features.geometry, reverse))
+            else:
+                first_radial = second_radial = self.radial_embedding(distance)
+            if getattr(self, "_join_radial_pairs", False):
+                if getattr(self, "_fused_trainable_pairs", False) and features.dense_ordered:
+                    from hip_orb.dense_pair_inputs import dense_pair_inputs
+                    joined = dense_pair_inputs(features.nodes, features.edges, charges, i, j,
+                                               forward, reverse, unit.contiguous(), first_radial,
+                                               second_radial, sizes)
+                else:
+                    joined = torch.cat((inputs(i, j, forward, unit, first_radial),
+                                        inputs(j, i, reverse, -unit, second_radial)))
+                directed = self.pair_residual(self.pair_adapter(joined))
+                first, second = directed.split(len(i)) if len(i) else (directed, directed)
+            else:
+                first = self.pair_residual(self.pair_adapter(inputs(i, j, forward, unit, first_radial)))
+                second = self.pair_residual(self.pair_adapter(inputs(j, i, reverse, -unit, second_radial)))
+        self.pair_adapter[0]._hip_radial_source = None
         node_inputs = torch.cat((features.nodes, charges[:, None]), dim=-1)
         if self.neighbor_pooling:
+            def context_mlp(module, value):
+                if self.checkpoint_context and self.training and torch.is_grad_enabled():
+                    from torch.utils.checkpoint import checkpoint
+                    return checkpoint(module, value, use_reentrant=False)
+                return module(value)
             # Local weighted means prevent the context scale from growing with molecule size.
             pool_cutoff = self.cutoff if self.cutoff is not None else self.radial_cutoff
             weights = 0.5 * (torch.cos(torch.pi * distance / pool_cutoff) + 1)
@@ -244,9 +305,16 @@ class HessianHead(nn.Module):
             def pool(first, second):
                 return pool_directed_pairs(first, second, i, j, weights, count)
             pooled = pool(first, second)
-            node_inputs = self.node_update(torch.cat((node_inputs, pooled), dim=-1))
-            first = first + self.pair_update(torch.cat((first, node_inputs[i], node_inputs[j]), dim=-1))
-            second = second + self.pair_update(torch.cat((second, node_inputs[j], node_inputs[i]), dim=-1))
+            node_inputs = context_mlp(self.node_update, torch.cat((node_inputs, pooled), dim=-1))
+            if getattr(self, "_join_context_pairs", getattr(self, "_join_radial_pairs", False)):
+                joined = torch.cat((torch.cat((first, node_inputs[i], node_inputs[j]), dim=-1),
+                                    torch.cat((second, node_inputs[j], node_inputs[i]), dim=-1)))
+                updated = context_mlp(self.pair_update, joined)
+                a, b = updated.split(len(i)) if len(i) else (updated, updated)
+                first, second = first + a, second + b
+            else:
+                first = first + context_mlp(self.pair_update, torch.cat((first, node_inputs[i], node_inputs[j]), dim=-1))
+                second = second + context_mlp(self.pair_update, torch.cat((second, node_inputs[j], node_inputs[i]), dim=-1))
             for context in self.extra_context_rounds:
                 pooled = pool(first, second)
                 node_inputs, first, second = context(node_inputs, pooled, first, second, i, j)
@@ -363,20 +431,44 @@ class HIPOrb(nn.Module):
                  radial_features="log", radial_cutoff=12.0, radial_bases=16,
                  pair_residual_layers=0, neighbor_pooling=False, extra_orb_round=False,
                  translation_projection=False, context_rounds=1, mlp_hidden=None,
-                 all_to_all=False, orb_initialization="pretrained", orb_message_graph="backbone"):
+                 all_to_all=False, orb_initialization="pretrained", orb_message_graph="backbone",
+                 orb_rounds=1, orb_combine_backbone_edges=False, orb_feature_adapters="none",
+                 radial_log_range=4.0, shared_geometry=False, backbone_layer_mix=0,
+                 checkpoint_context=False):
         super().__init__()
         self.base = base.requires_grad_(False).eval()
         self.adapter = adapter
         self.head = HessianHead(backbone_latent_dim(base.model), hidden, cutoff,
                                 radial_features, radial_cutoff, radial_bases,
                                 pair_residual_layers, neighbor_pooling, translation_projection,
-                                context_rounds, mlp_hidden, all_to_all)
+                                context_rounds, mlp_hidden, all_to_all,
+                                radial_log_range, shared_geometry, checkpoint_context)
         self.head.to(next(base.parameters()))
+        if orb_rounds < 1 or (not extra_orb_round and orb_rounds != 1):
+            raise ValueError("Orb rounds require an enabled extension and a positive count")
+        if orb_combine_backbone_edges and (not extra_orb_round or orb_message_graph != "hessian"):
+            raise ValueError("Combining backbone edges requires the dense Orb extension")
+        if orb_feature_adapters not in ("none", "atom", "edge", "both"):
+            raise ValueError("Unknown Orb feature adapter mode")
+        if orb_feature_adapters != "none" and not extra_orb_round:
+            raise ValueError("Feature adapters require an extra Orb round")
+        if shared_geometry and (not extra_orb_round or orb_message_graph != "hessian" or orb_feature_adapters != "none"):
+            raise ValueError("Shared geometry requires the dense Orb extension without feature adapters")
+        if backbone_layer_mix and not extra_orb_round:
+            raise ValueError("A backbone layer mixture requires an extra Orb round")
         if extra_orb_round:
             from orb_models.common.models.gns import AttentionInteractionNetwork
             stacks = getattr(base.model, "gnn_stacks", None)
             if not stacks or not isinstance(stacks[-1], AttentionInteractionNetwork):
                 raise ValueError("An extra Orb round requires an Orb attention processor")
+            if backbone_layer_mix < 0 or backbone_layer_mix > len(stacks):
+                raise ValueError("Invalid number of frozen backbone layers to mix")
+            if backbone_layer_mix:
+                if orb_message_graph == "hessian" and not orb_combine_backbone_edges:
+                    raise ValueError("A dense layer mixture must retain backbone edge features")
+                from hip_orb.orb_extension import FrozenLayerMixture
+                self.head.backbone_mixture = FrozenLayerMixture(self.head.config["latent_dim"], backbone_layer_mix)
+                self.head.config["backbone_layer_mix"] = backbone_layer_mix
             # Register with the head so its optimizer and checkpoints include this layer.
             from hip_orb.orb_extension import make_orb_processor, DenseOrbEdgeEncoder
             if orb_message_graph not in ("backbone", "hessian"):
@@ -384,12 +476,34 @@ class HIPOrb(nn.Module):
             if orb_message_graph == "hessian" and not all_to_all:
                 raise ValueError("The dense Orb extension requires the all-to-all Hessian graph")
             self.head.orb_message_layer = make_orb_processor(stacks[-1], orb_initialization)
+            if orb_rounds > 1:
+                self.head.extra_orb_layers = nn.ModuleList(
+                    make_orb_processor(stacks[-1], orb_initialization) for _ in range(orb_rounds - 1))
+                self.head.config["orb_rounds"] = orb_rounds
             self.head.config.update(extra_orb_round=True,
                                     extra_orb_initialization=("copy_final_processor" if orb_initialization == "pretrained" else "random"))
             if orb_message_graph != "backbone":
                 self.head.config["orb_message_graph"] = orb_message_graph
-                self.head.orb_distance_encoder = DenseOrbEdgeEncoder(
-                    self.head.config["latent_dim"], radial_cutoff, radial_bases)
+                expanded_basis = "log_gaussian" if radial_features == "log_gaussian" else "bessel"
+                encoder = DenseOrbEdgeEncoder(self.head.config["latent_dim"], radial_cutoff, radial_bases,
+                                              expanded_basis, radial_log_range)
+                if shared_geometry:
+                    self.head.shared_geometry_encoder = encoder
+                    self.head.orb_distance_encoder = nn.Linear(self.head.config["latent_dim"], self.head.config["latent_dim"])
+                else:
+                    self.head.orb_distance_encoder = encoder
+                if orb_combine_backbone_edges:
+                    from hip_orb.orb_extension import BackboneEdgeResidual
+                    self.head.orb_backbone_edge_residual = BackboneEdgeResidual(self.head.config["latent_dim"])
+                    self.head.config["orb_combine_backbone_edges"] = True
+            if orb_feature_adapters != "none":
+                from hip_orb.orb_extension import OrbFeatureAdapters
+                self.head.orb_feature_adapter = OrbFeatureAdapters(
+                    self.head.config["latent_dim"], orb_feature_adapters, mlp_hidden or hidden,
+                    radial_scale=radial_cutoff, radial_bases=radial_bases,
+                    radial_features="log_gaussian" if radial_features == "log_gaussian" else "bessel",
+                    radial_log_range=radial_log_range)
+                self.head.config["orb_feature_adapters"] = orb_feature_adapters
             self.head.to(next(base.parameters()))
 
     def train(self, mode=True):
@@ -413,8 +527,18 @@ class HIPOrb(nn.Module):
             dense_graph.senders, dense_graph.receivers = senders, receivers
             dense_graph.n_edge = graph.n_node * (graph.n_node - 1)
             dense_graph.edge_features = {"vectors": graph.node_features["positions"][receivers] - graph.node_features["positions"][senders]}
+        captured, hooks = [], []
+        if hasattr(self.head, "backbone_mixture"):
+            count = self.head.config["backbone_layer_mix"]
+            hooks = [layer.register_forward_hook(lambda module, args, result: captured.append(result))
+                     for layer in self.base.model.gnn_stacks[-count:]]
+        try:
+            with torch.no_grad():
+                out = self.base.model(graph)
+        finally:
+            for hook in hooks:
+                hook.remove()
         with torch.no_grad():
-            out = self.base.model(graph)
             charges = self.base.heads["latent_charges"](out["node_features"], graph).reshape(-1)
             cond_nodes, cond_edges = None, None
             if hasattr(self.head, "orb_message_layer"):
@@ -425,17 +549,41 @@ class HIPOrb(nn.Module):
                 if conditioner is not None:
                     cond_nodes, cond_edges = conditioner(dense_graph if dense_graph is not None else graph)
         nodes, edges = out["node_features"].detach(), out["edge_features"].detach()
+        if hasattr(self.head, "backbone_mixture"):
+            nodes, edges = self.head.backbone_mixture(captured)
+        geometry = None
         if dense_graph is not None:
             from hip_orb.block_layout import require
             vectors = dense_graph.edge_features["vectors"].detach()
             require((vectors.norm(dim=-1) > 0).all(), "Dense Orb edges require distinct positions")
-            edges = self.head.orb_distance_encoder(vectors)
+            if self.head.shared_geometry:
+                geometry = self.head.shared_geometry_encoder(vectors)
+                geometric = self.head.orb_distance_encoder(geometry)
+            else:
+                geometric = self.head.orb_distance_encoder(vectors)
+            edges = (self.head.orb_backbone_edge_residual(
+                geometric, edges, graph.senders, graph.receivers, senders, receivers, len(nodes),
+                dense_sizes=tuple(shape.tolist()) if getattr(self, "_dense_indexing", False) else None)
+                if hasattr(self.head, "orb_backbone_edge_residual") else geometric)
             # CPU-prepared lookup IDs refer to the original Orb edges, not this new graph.
             pairs = None
         if hasattr(self.head, "orb_message_layer"):
-            nodes, edges = self.head.orb_message_layer(
-                nodes, edges, senders, receivers, message_cutoff,
-                cond_nodes=cond_nodes, cond_edges=cond_edges)
+            if hasattr(self.head, "orb_feature_adapter"):
+                nodes, edges = self.head.orb_feature_adapter(
+                    nodes, edges, graph.node_features["atomic_numbers"], charges,
+                    graph.node_features["positions"].detach(), senders, receivers)
+            if getattr(self, "_dense_message_kernels", False) and dense_graph is not None:
+                from hip_orb.dense_interaction import dense_interaction
+                nodes, edges = dense_interaction(
+                    self.head.orb_message_layer, nodes, edges, senders, receivers, message_cutoff,
+                    cond_nodes=cond_nodes, cond_edges=cond_edges, sizes=tuple(shape.tolist()))
+            else:
+                nodes, edges = self.head.orb_message_layer(
+                    nodes, edges, senders, receivers, message_cutoff,
+                    cond_nodes=cond_nodes, cond_edges=cond_edges)
+            for processor in getattr(self.head, "extra_orb_layers", ()):
+                nodes, edges = processor(nodes, edges, senders, receivers, message_cutoff,
+                                         cond_nodes=cond_nodes, cond_edges=cond_edges)
         dimension = self.head.config["latent_dim"]
         if out["node_features"].shape[-1] != dimension or out["edge_features"].shape[-1] != dimension:
             raise ValueError("Orb output feature dimensions differ from the Hessian head")
@@ -451,6 +599,8 @@ class HIPOrb(nn.Module):
             coulomb.coulomb_constant if getattr(self, "_async_metadata", False) else float(coulomb.coulomb_constant),
             coulomb.direct_coulomb_erf_damping_sigma,
             pairs,
+            geometry,
+            dense_graph is not None and getattr(self, "_dense_indexing", False),
         )
 
     def forward(self, graph):

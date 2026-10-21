@@ -92,3 +92,25 @@ def test_mass_weighted_mse_scaling_and_zero_gradient():
     error = torch.ones(2, 6, 6)
     torch.testing.assert_close(hessian_error_loss(error, "mass_weighted_mse", 2 * masses),
                                hessian_error_loss(error, "mass_weighted_mse", masses) / 4)
+
+
+def test_mass_weighted_block_rmse_rotation_gradient_and_zero():
+    from hip_orb.losses import rotate_hessian
+    masses = torch.tensor([[1., 12., 16.], [14., 1., 32.]], dtype=torch.float64)
+    error = torch.randn(2, 9, 9, dtype=torch.float64, requires_grad=True)
+    rotation, _ = torch.linalg.qr(torch.randn(3, 3, dtype=torch.float64))
+    weights = masses.repeat_interleave(3, dim=1).rsqrt()
+    expected = hessian_error_loss(error * weights[:, :, None] * weights[:, None, :], "block_rmse")
+    actual = hessian_error_loss(error, "mass_weighted_block_rmse", masses)
+    torch.testing.assert_close(actual, expected)
+    a, = torch.autograd.grad(actual, error, retain_graph=True)
+    b, = torch.autograd.grad(expected, error)
+    torch.testing.assert_close(a, b)
+    rotated = rotate_hessian(error.detach(), rotation).requires_grad_()
+    rotated_loss = hessian_error_loss(rotated, "mass_weighted_block_rmse", masses)
+    torch.testing.assert_close(rotated_loss, actual)
+    rotated_loss.backward()
+    torch.testing.assert_close(rotated.grad, rotate_hessian(a, rotation))
+    zero = torch.zeros_like(error, requires_grad=True)
+    hessian_error_loss(zero, "mass_weighted_block_rmse", masses).backward()
+    assert torch.count_nonzero(zero.grad) == 0

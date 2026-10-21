@@ -19,7 +19,7 @@ from hip_orb.data import OrbMolDataset, make_loader, unpack_hessian
 from hip_orb.execution import EXECUTION_MODES, configure_execution
 from hip_orb.graphs import canonical_message_graph, refresh_message_vectors
 from hip_orb.losses import LOSS_TYPES
-from hip_orb.metrics import hessian_metrics
+from hip_orb.metrics import batched_hessian_metrics, hessian_metrics, rotate_hessians
 from hip_orb.model import HIPOrb
 from hip_orb.packed_training import collate_packed_compact, packed_update
 from hip_orb.preparation import prepare_batch
@@ -36,6 +36,19 @@ def timed_batches(loader, timing):
             return
         timing["loader_s"] += time.perf_counter() - started
         yield batch
+
+
+def enforce_zero_regularization(model, optimizer):
+    """Keep weight decay and dropout disabled, including after checkpoint loading."""
+    for group in optimizer.param_groups:
+        group["weight_decay"] = 0.0
+    for root in (model.base, model.head):
+        for module in root.modules():
+            if isinstance(module, (torch.nn.Dropout, torch.nn.Dropout1d, torch.nn.Dropout2d,
+                                   torch.nn.Dropout3d, torch.nn.AlphaDropout,
+                                   torch.nn.FeatureAlphaDropout)):
+                module.p = 0.0
+    return {"weight_decay": 0.0, "dropout": 0.0}
 
 
 def train_update(model, optimizer, batch, device, seed, *, scalar_loss=True, loss_type="mse",
@@ -56,7 +69,7 @@ def train_update(model, optimizer, batch, device, seed, *, scalar_loss=True, los
         return (float(loss) if scalar_loss else loss), len(batch["coords"])
 
 
-def validate(model, loader, device, report_samples=32):
+def validate(model, loader, device, report_samples=32, *, accelerated=True):
     """Stream the separate validation set and average each metric per molecule."""
     model.eval()
     totals, counts, batch_sizes, examples = {}, {}, [], []
@@ -75,15 +88,28 @@ def validate(model, loader, device, report_samples=32):
             graph = refresh_message_vectors(canonical_message_graph(
                 model.adapter.from_ase_atoms_list(rotated["molecules"], device=device)))
             rotated_predictions = model.head(model.features(graph, sizes=sizes))
-            rotation = rotated["rotation"].to(device)
-            transform = torch.kron(torch.eye(len(molecules[0]), device=device), rotation.contiguous())
+            rotation = rotated["rotation"].contiguous().to(device)
+            if accelerated:
+                predictions = torch.stack(predicted)
+                positions = batch["coords"].to(device=device, dtype=target.dtype)
+                masses = torch.as_tensor(np.stack([a.get_masses() for a in molecules]),
+                                         device=device, dtype=target.dtype)
+                rows = batched_hessian_metrics(predictions, target, positions, masses)
+                rotation_errors = (torch.stack(rotated_predictions) -
+                                   rotate_hessians(predictions, rotation)).square().mean((-2, -1)).sqrt().tolist()
+            else:
+                transform = torch.kron(torch.eye(len(molecules[0]), device=device), rotation.contiguous())
+                rows = []
+                rotation_errors = []
+                for i, atoms in enumerate(molecules):
+                    positions = torch.as_tensor(atoms.positions, device=device, dtype=target.dtype)
+                    masses = torch.as_tensor(atoms.get_masses(), device=device, dtype=target.dtype)
+                    rows.append(hessian_metrics(predicted[i], target[i], positions, masses))
+                    rotation_errors.append(float((rotated_predictions[i] -
+                        transform @ predicted[i] @ transform.T).square().mean().sqrt()))
             batch_sizes.append(len(molecules))
-            for i, atoms in enumerate(molecules):
-                positions = torch.as_tensor(atoms.positions, device=device, dtype=target.dtype)
-                masses = torch.as_tensor(atoms.get_masses(), device=device, dtype=target.dtype)
-                row = hessian_metrics(predicted[i], target[i], positions, masses)
-                row["rotation_rmse"] = float((rotated_predictions[i] -
-                    transform @ predicted[i] @ transform.T).square().mean().sqrt())
+            for i, row in enumerate(rows):
+                row["rotation_rmse"] = rotation_errors[i]
                 for key, value in row.items():
                     if not math.isfinite(value):
                         raise ValueError(f"Nonfinite validation metric: {key}")
@@ -156,12 +182,19 @@ def main():
                         help="Maximum per-molecule examples retained in the validation report")
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--hessian-cutoff", type=float)
-    parser.add_argument("--radial-features", choices=("log", "bessel"), default="log")
+    parser.add_argument("--radial-features", choices=("log", "bessel", "log_gaussian"), default="log")
+    parser.add_argument("--radial-log-range", type=float, default=4.0)
+    parser.add_argument("--shared-geometry", action="store_true")
+    parser.add_argument("--backbone-layer-mix", type=int, default=0)
+    parser.add_argument("--checkpoint-context", action="store_true")
     parser.add_argument("--radial-cutoff", type=float, default=12.0)
     parser.add_argument("--radial-bases", type=int, default=16)
     parser.add_argument("--pair-residual-layers", type=int, default=0)
     parser.add_argument("--neighbor-pooling", action="store_true")
     parser.add_argument("--extra-orb-round", action="store_true")
+    parser.add_argument("--orb-rounds", type=int, default=1)
+    parser.add_argument("--orb-combine-backbone-edges", action="store_true")
+    parser.add_argument("--orb-feature-adapters", choices=("none", "atom", "edge", "both"), default="none")
     parser.add_argument("--all-to-all", action="store_true",
                         help="Use every Hessian pair, global context pooling, and independent untruncated radial features")
     parser.add_argument("--orb-initialization", choices=("pretrained", "random"), default="pretrained")
@@ -171,18 +204,23 @@ def main():
     parser.add_argument("--mlp-hidden", type=int,
                         help="Internal MLP width; defaults to the readout feature width")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--loss-scale", type=float, default=1.0,
+                        help="Fixed multiplier for balanced packed training loss and gradients")
     parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
     parser.add_argument("--warmup-fraction", type=float, default=0.15)
     parser.add_argument("--loss-type", choices=LOSS_TYPES, default="mse",
                         help="Hessian MSE, element MAE, atom-pair block RMSE, or mass-weighted Hessian MSE")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--execution-mode", choices=EXECUTION_MODES, default="optimized",
-                        help="Use float32 optimizations or the eager reference implementation")
+                        help="Use verified selective-precision kernels or the eager reference implementation")
     parser.add_argument("--packed-loss-implementation", choices=("dense", "pairs"), default="dense")
     parser.add_argument("--linear-input-alignment", type=int, choices=(1, 8, 16, 32, 64), default=1)
     parser.add_argument("--radial-only-backward", action="store_true")
+    parser.add_argument("--head-input-fusion", choices=("none", "cast", "pairs", "both"), default="none")
     parser.add_argument("--fused-optimizer", action="store_true")
     parser.add_argument("--precision-policy", choices=("float32", "fp16-message-head"), default="float32")
+    parser.add_argument("--precision-overrides", type=json.loads, default=None,
+                        help="Map linear layer patterns to targeted LinearPolicy settings")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--translation-scale", type=float, default=0.0,
                         help="Random shifts per molecule, uniform within +/- this many angstroms")
@@ -211,15 +249,35 @@ def main():
         parser.error("Consistency requires two reference views; views must be 1 or 2")
     if args.batching not in ("equal", "balanced"):
         parser.error("Batching must be equal or balanced")
+    if not math.isfinite(args.loss_scale) or args.loss_scale <= 0:
+        parser.error("Loss scale must be finite and positive")
+    if args.loss_scale != 1.0 and args.batching != "balanced":
+        parser.error("A loss multiplier requires balanced packed training")
     if args.batching == "balanced" and (
-            args.loss_type not in ("block_rmse", "mse", "mae")
+            args.loss_type not in ("block_rmse", "mse", "mae", "mass_weighted_block_rmse")
             or args.translation_scale or args.consistency_weight
             or args.reference_views != 1 or args.rotation_sampling != "uniform"):
-        parser.error("Balanced packed training requires one uniform view, no shifts or consistency, and block_rmse/mse/mae")
+        parser.error("Balanced packed training requires one uniform view, no shifts or consistency, and a supported packed loss")
     if args.precision_policy != "float32" and (args.batching != "balanced" or not args.device.startswith("cuda")):
         parser.error("Mixed precision requires balanced packed training on CUDA")
+    if args.precision_overrides is None:
+        # Unnormalized context and readout MLPs can exceed the FP16 range.
+        args.precision_overrides = {}
+        if args.precision_policy != "float32":
+            args.precision_overrides["head.node_head.[02]"] = {"dtype": "fp32"}
+            if args.neighbor_pooling:
+                args.precision_overrides["head.node_update.*"] = {"dtype": "fp32"}
+                args.precision_overrides["head.pair_update.*"] = {"dtype": "fp32"}
+            if args.context_rounds > 1:
+                args.precision_overrides["head.extra_context_rounds.*.*.*"] = {"dtype": "fp32"}
+    if not isinstance(args.precision_overrides, dict):
+        parser.error("Precision overrides must be a mapping")
+    if args.precision_overrides and args.precision_policy == "float32":
+        parser.error("Precision overrides require mixed precision")
     if args.linear_input_alignment != 1 and args.precision_policy == "float32":
         parser.error("Input alignment requires mixed precision")
+    if args.head_input_fusion != "none" and args.precision_policy == "float32":
+        parser.error("Head input fusion requires mixed precision")
     if args.fused_optimizer and not args.device.startswith("cuda"):
         parser.error("Fused optimizer requires CUDA")
     if args.radial_only_backward and args.precision_policy == "float32":
@@ -245,7 +303,7 @@ def main():
     if args.loss_type not in LOSS_TYPES:
         parser.error(f"Hessian loss must be one of {LOSS_TYPES}")
     loss_key = f"train_{args.loss_type}"
-    mass_weighting = "ase_standard_atomic_masses_amu" if args.loss_type == "mass_weighted_mse" else None
+    mass_weighting = "ase_standard_atomic_masses_amu" if args.loss_type.startswith("mass_weighted_") else None
     if (min(args.batch_size, args.epochs, args.loader_open_files, args.prefetch_factor) < 1
             or args.workers < 0 or args.loader_cache_mib < 0
             or (args.max_hessian_elements is not None and args.max_hessian_elements < 1)):
@@ -317,11 +375,18 @@ def main():
                               translation_projection=args.translation_projection,
                               context_rounds=args.context_rounds, mlp_hidden=args.mlp_hidden,
                               all_to_all=args.all_to_all, orb_initialization=args.orb_initialization,
+                              orb_rounds=args.orb_rounds, orb_combine_backbone_edges=args.orb_combine_backbone_edges,
+                              orb_feature_adapters=args.orb_feature_adapters,
+                              radial_log_range=args.radial_log_range, shared_geometry=args.shared_geometry,
+                              backbone_layer_mix=args.backbone_layer_mix, checkpoint_context=args.checkpoint_context,
                               orb_message_graph=args.orb_message_graph, **weights)
     execution_config = configure_execution(model, args.execution_mode)
     model.head._radial_only_backward = args.radial_only_backward
+    model.head._fused_pair_inputs = args.head_input_fusion in ("pairs", "both")
     model._compact_pair_loss = args.packed_loss_implementation == "pairs"
-    execution_config.update(linear_input_alignment=args.linear_input_alignment,
+    execution_config.update(head_input_fusion=args.head_input_fusion,
+                            checkpoint_context=args.checkpoint_context,
+                            linear_input_alignment=args.linear_input_alignment,
                             fused_optimizer=args.fused_optimizer,
                             radial_only_backward=args.radial_only_backward,
                             packed_loss_implementation=args.packed_loss_implementation,
@@ -335,14 +400,18 @@ def main():
     precision_context = nullcontext()
     if args.precision_policy != "float32":
         from hip_orb.mixed_precision import LinearPolicy, linear_precision
+        overrides = {pattern: LinearPolicy(**settings)
+                     for pattern, settings in args.precision_overrides.items()}
         precision_context = linear_precision(
             model, head=LinearPolicy("fp16_f32", fuse_silu=True, activation_dtype="fp16",
-                                    input_alignment=args.linear_input_alignment),
+                                    input_alignment=args.linear_input_alignment,
+                                    fused_input_cast=args.head_input_fusion in ("cast", "both")),
             backbone=LinearPolicy("fp16", include=("base.model.gnn_stacks.*._*mlp.mlp.NN-*",),
-                                  activation_dtype="fp16"))
+                                  activation_dtype="fp16"), overrides=overrides)
         scaler = torch.amp.GradScaler("cuda", init_scale=1024)
         execution_config.update(head_precision="fp16-input-fp32-output-fused-silu",
-                                backbone_precision="fp16-message-mlps-fp32-residuals")
+                                backbone_precision="fp16-message-mlps-fp32-residuals",
+                                precision_overrides=args.precision_overrides)
     skipped_updates = 0
     global_step = 0
     previous_elapsed, last_validation_elapsed = 0.0, 0.0
@@ -355,6 +424,8 @@ def main():
             raise ValueError("Checkpoint architecture or Orb base differs")
         if saved.get("loss_type", "mse") != args.loss_type:
             raise ValueError("Checkpoint Hessian loss differs from the configured loss")
+        if saved.get("loss_scale", 1.0) != args.loss_scale:
+            raise ValueError("Checkpoint loss multiplier differs")
         if saved.get("lr_schedule_config", schedule_config) != schedule_config:
             raise ValueError("Checkpoint learning rate schedule differs")
         if saved.get("augmentation_config", augmentation_config) != augmentation_config:
@@ -383,6 +454,7 @@ def main():
         execution_history = saved.get("execution_history", [])
         if not execution_history and saved.get("execution_config"):
             execution_history = [{"global_step": global_step, "config": saved["execution_config"]}]
+    regularization_config = enforce_zero_regularization(model, optimizer)
     if not execution_history or execution_history[-1]["config"] != execution_config:
         execution_history.append({"global_step": global_step, "config": execution_config})
     train_loader = make_loader(training, max_batches=args.max_steps,
@@ -409,6 +481,7 @@ def main():
 
     def save_checkpoint():
         checkpoint = {"head": model.head.state_dict(), "head_config": model.head.config,
+                      "regularization_config": regularization_config,
                       "batching_config": batching_config,
                       "augmentation_config": augmentation_config,
                       "optimizer": optimizer.state_dict(), "global_step": global_step,
@@ -423,7 +496,7 @@ def main():
                       "training_elapsed_s": elapsed(),
                       "last_validation_elapsed_s": last_validation_elapsed,
                       "epoch": current_epoch, "epoch_batches": epoch_batches,
-                      "loss_type": args.loss_type, "mass_weighting": mass_weighting,
+                      "loss_type": args.loss_type, "loss_scale": args.loss_scale, "mass_weighting": mass_weighting,
                       "train_loss": history, loss_key: history,
                       "validation_history": validation_history,
                       "training_batch_sizes": training_batch_sizes}
@@ -436,6 +509,7 @@ def main():
     try:
         precision_stats = precision_stack.enter_context(precision_context)
         print(json.dumps({"event": "training_started", "global_step": global_step,
+                          "regularization_config": regularization_config,
                           "head_config": model.head.config,
                           "execution_config": execution_config,
                           "batching_config": batching_config,
@@ -453,6 +527,7 @@ def main():
             loss_sum, samples = 0.0, 0
             model.train()
             timing = {"loader_s": 0.0, "update_s": 0.0, "samples": 0, "updates": 0}
+            window_started = time.perf_counter()
             for batch in timed_batches(train_loader, timing):
                 if limit_reached():
                     break
@@ -463,8 +538,15 @@ def main():
                 update_started = time.perf_counter()
                 scale_before = None if scaler is None else scaler.get_scale()
                 if args.batching == "balanced":
-                    loss, size = packed_update(model, optimizer, batch, args.device,
-                                               args.seed + epoch, loss_type=args.loss_type, scaler=scaler)
+                    try:
+                        loss, size = packed_update(model, optimizer, batch, args.device,
+                                                   args.seed + epoch, loss_type=args.loss_type, scaler=scaler,
+                                                   loss_scale=args.loss_scale)
+                    except FloatingPointError:
+                        save_checkpoint()
+                        torch.save({"batch": batch, "seed": args.seed + epoch,
+                                    "global_step": global_step}, args.output / "nonfinite_batch.pt")
+                        raise
                 else:
                     loss, size = train_update(model, optimizer, batch, args.device, args.seed + epoch,
                                           loss_type=args.loss_type,
@@ -490,7 +572,8 @@ def main():
                     training_batch_sizes.append(size)
                 now = elapsed()
                 if global_step == 1 or global_step % 1000 == 0:
-                    measured_s = max(timing["loader_s"] + timing["update_s"], 1e-12)
+                    # Include CUDA completion waits and loop work outside packed_update.
+                    measured_s = max(time.perf_counter() - window_started, 1e-12)
                     print(json.dumps({"global_step": global_step, "elapsed_s": now,
                                       loss_key: loss, "batch_size": size, "lr": update_lr,
                                       "loader_wait_percent": 100 * timing["loader_s"] / measured_s,
@@ -498,6 +581,7 @@ def main():
                                       "updates_per_second": timing["updates"] / measured_s,
                                       "window_mean_batch_size": timing["samples"] / timing["updates"]}), flush=True)
                     timing.update(loader_s=0.0, update_s=0.0, samples=0, updates=0)
+                    window_started = time.perf_counter()
                 if not total_limit_reached() and (not limit_reached() or args.session_steps is not None) and (
                     (args.validation_every and global_step % args.validation_every == 0)
                     or (args.validation_every_seconds
@@ -533,6 +617,7 @@ def main():
             raise RuntimeError("Frozen Orb state changed")
         saved = torch.load(args.output / "head.pt", map_location="cpu", weights_only=True)
         report = {"runner": "hip_orb.train", "loader": "OrbMolDataset",
+                  "regularization_config": regularization_config,
                   "batching_config": batching_config,
                   "execution_config": execution_config,
                   "execution_history": execution_history,
@@ -548,7 +633,7 @@ def main():
                   "validation_every_seconds": args.validation_every_seconds,
                   "training_elapsed_s": training_elapsed_s,
                   "training_batch_sizes": training_batch_sizes,
-                  "loss_type": args.loss_type, "mass_weighting": mass_weighting,
+                  "loss_type": args.loss_type, "loss_scale": args.loss_scale, "mass_weighting": mass_weighting,
                   "train_loss": history, loss_key: history,
                   "validation_history": validation_history, **final,
                   "frozen_state_unchanged": unchanged, "separate_validation_set": True,
