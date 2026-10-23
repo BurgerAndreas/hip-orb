@@ -56,3 +56,23 @@ def test_scaled_silu_shapes_bias_and_higher_derivatives(rows):
     )
     for u, v in zip(a, r, strict=True):
         torch.testing.assert_close(u, v, atol=1e-16, rtol=1e-3)
+
+
+def test_scaled_silu_large_input_keeps_finite_values_and_gradients():
+    from hip_orb.scaled_silu import scaled_linear_silu
+
+    torch.manual_seed(43)
+    x = (torch.randn(513, 257, device="cuda") * 2**18).requires_grad_()
+    w = (torch.randn(128, 257, device="cuda") / 257**0.5).requires_grad_()
+    b = torch.randn(128, device="cuda", requires_grad=True)
+    actual = scaled_linear_silu(x, w, b, compact=True)
+    reference = torch.nn.functional.silu(torch.nn.functional.linear(x, w, b))
+    assert torch.isfinite(actual).all()
+    assert float((actual-reference).norm()/reference.norm()) < 1e-3
+    g = torch.randn_like(actual) * 1e-8
+    for a, r in zip(torch.autograd.grad(actual, (x,w,b), g),
+                    torch.autograd.grad(reference, (x,w,b), g), strict=True):
+        assert torch.isfinite(a).all()
+        # This range test includes cancellation near the SiLU transition.
+        assert float((a-r).norm()/r.norm().clamp_min(1e-30)) < 3e-2
+        assert torch.nn.functional.cosine_similarity(a.flatten(), r.flatten(), dim=0) > 0.999

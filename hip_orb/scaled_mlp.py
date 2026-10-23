@@ -64,21 +64,26 @@ def _quantize(g, pre=None, previous=None, need_bias=False, *, fused_parts=False)
     return q, maximum, bias
 
 
-def _product(a, b, maximum):
+def _product(a, b, maximum, activation_maximum=None):
     out = torch.mm(a, b, out_dtype=torch.float32)
     if out.numel():
         _restore[(triton.cdiv(out.numel(), 1024),)](out, maximum, out, out.numel(), 1024)
+    if out.numel() and activation_maximum is not None:
+        _restore[(triton.cdiv(out.numel(), 1024),)](
+            out, activation_maximum, out, out.numel(), 1024
+        )
     return out
 
 
-def _activation(a, w, b):
-    pre = torch.mm(a, w.T, out_dtype=torch.float32)
-    h = torch.empty_like(pre, dtype=torch.float16)
-    saved = torch.empty_like(h)
+def _activation(a, w, b, maximum):
+    pre = _product(a, w.T, maximum)
+    h = torch.empty_like(pre)
+    saved = torch.empty_like(pre, dtype=torch.float16)
     _save[(triton.cdiv(pre.numel(), 1024),)](
         pre, b, h, saved, pre.numel(), pre.shape[1], b is not None, 1024
     )
-    return h, saved
+    quantized, maximum, _ = _quantize(h)
+    return quantized, saved, maximum
 
 
 class _MLP(torch.autograd.Function):
@@ -93,25 +98,26 @@ class _MLP(torch.autograd.Function):
             and x.stride() == (width + pad, 1)
             and x.storage_offset() == 0
         ):
-            a = x.as_strided((len(x), width + pad), (width + pad, 1)).half()
+            a = x.as_strided((len(x), width + pad), (width + pad, 1))
         else:
-            a = x.reshape(-1, width).half()
+            a = x.reshape(-1, width)
             if pad:
                 a = F.pad(a, (0, pad))
+        a, sa, _ = _quantize(a.contiguous())
         wh1 = F.pad(w1.half(), (0, pad)) if pad else w1.half()
         wh2 = w2.half()
         wh3 = w3.half()
-        h1, p1 = _activation(a, wh1, b1)
-        h2, p2 = _activation(h1, wh2, b2)
-        y = torch.mm(h2, wh3.T, out_dtype=torch.float32)
+        h1, p1, s1 = _activation(a, wh1, b1, sa)
+        h2, p2, s2 = _activation(h1, wh2, b2, s1)
+        y = _product(h2, wh3.T, s2)
         if b3 is not None:
             y.add_(b3)
-        ctx.save_for_backward(x, w1, b1, w2, b2, w3, b3, a, wh1, wh2, wh3, h1, p1, h2, p2)
+        ctx.save_for_backward(x, w1, b1, w2, b2, w3, b3, a, wh1, wh2, wh3, h1, p1, h2, p2, sa, s1, s2)
         return y.reshape(*x.shape[:-1], len(w3))
 
     @staticmethod
     def backward(ctx, g):
-        x, w1, b1, w2, b2, w3, b3, a, wh1, wh2, wh3, h1, p1, h2, p2 = ctx.saved_tensors
+        x, w1, b1, w2, b2, w3, b3, a, wh1, wh2, wh3, h1, p1, h2, p2, sa, sh1, sh2 = ctx.saved_tensors
         needs = ctx.needs_input_grad[:7]
         if torch.is_grad_enabled():
             with torch.enable_grad():
@@ -128,17 +134,17 @@ class _MLP(torch.autograd.Function):
             return tuple(next(values) if need else None for need in needs) + (None,)
         q3, s3, db3 = _quantize(g.reshape(-1, len(w3)).contiguous(), need_bias=needs[6],
                                   fused_parts=ctx.fused_reductions)
-        dw3 = _product(q3.T, h2, s3) if needs[5] else None
+        dw3 = _product(q3.T, h2, s3, sh2) if needs[5] else None
         raw2 = torch.mm(q3, wh3, out_dtype=torch.float32)
         del q3
         q2, s2, db2 = _quantize(raw2, p2, s3, needs[4])
         del raw2
-        dw2 = _product(q2.T, h1, s2) if needs[3] else None
+        dw2 = _product(q2.T, h1, s2, sh1) if needs[3] else None
         raw1 = torch.mm(q2, wh2, out_dtype=torch.float32)
         del q2
         q1, s1, db1 = _quantize(raw1, p1, s2, needs[2])
         del raw1
-        dw1 = _product(q1.T, a, s1)[:, : x.shape[-1]].contiguous() if needs[1] else None
+        dw1 = _product(q1.T, a, s1, sa)[:, : x.shape[-1]].contiguous() if needs[1] else None
         dx = _product(q1, wh1, s1)[:, : x.shape[-1]].reshape(x.shape) if needs[0] else None
         return dx, dw1, db1, dw2, db2, dw3, db3, None
 

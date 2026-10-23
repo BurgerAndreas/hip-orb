@@ -286,7 +286,14 @@ def packed_update(model, optimizer, batch, device="cuda", seed=7, loss_type="blo
         else:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.head.parameters(), 10.0)
+        try:
+            torch.nn.utils.clip_grad_norm_(
+                model.head.parameters(), 10.0, error_if_nonfinite=scaler is None
+            )
+        except RuntimeError as error:
+            if "non-finite" not in str(error):
+                raise
+            raise FloatingPointError("Packed training gradients are not finite") from error
         if scaler is None:
             optimizer.step()
         else:

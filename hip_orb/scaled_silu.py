@@ -72,8 +72,18 @@ class _ScaledSiLU(torch.autograd.Function):
         else:
             a = F.pad(x.reshape(-1, width), (0, pad)) if pad else x.reshape(-1, width)
         wp = F.pad(w, (0, pad)) if pad else w
-        ah, wh = a.half(), wp.half()
-        pre = torch.mm(ah, wh.T, out_dtype=torch.float32) if half_forward else a @ wp.T
+        a = a.contiguous()
+        maximum = a.abs().amax()
+        ah = torch.empty_like(a, dtype=torch.float16)
+        _scale_cast[(triton.cdiv(a.numel(), 1024),)](a, maximum, ah, a.numel(), 1024)
+        wh = wp.half()
+        if half_forward:
+            pre = torch.mm(ah, wh.T, out_dtype=torch.float32)
+            _restore[(triton.cdiv(pre.numel(), 1024),)](
+                pre, maximum, pre, pre.numel(), 1024
+            )
+        else:
+            pre = a @ wp.T
         if compact:
             from hip_orb.compact_silu import save_activation
 
@@ -85,12 +95,12 @@ class _ScaledSiLU(torch.autograd.Function):
                     pre, b, y, y.numel(), y.shape[1], b is not None, 1024
                 )
         ctx.compact = compact
-        ctx.save_for_backward(x, w, b, ah, wh, pre)
+        ctx.save_for_backward(x, w, b, ah, wh, pre, maximum)
         return y.reshape(*x.shape[:-1], len(w))
 
     @staticmethod
     def backward(ctx, g):
-        x, w, b, a, wh, pre = ctx.saved_tensors
+        x, w, b, a, wh, pre, activation_maximum = ctx.saved_tensors
         if torch.is_grad_enabled():
             with torch.enable_grad():
                 y = F.silu(F.linear(x, w, b))
@@ -146,6 +156,10 @@ class _ScaledSiLU(torch.autograd.Function):
 
         dx = product(q, wh)[:, : x.shape[-1]].reshape(x.shape) if ctx.needs_input_grad[0] else None
         dw = product(q.T, a)[:, : x.shape[-1]].contiguous() if ctx.needs_input_grad[1] else None
+        if dw is not None:
+            _restore[(triton.cdiv(dw.numel(), 1024),)](
+                dw, activation_maximum, dw, dw.numel(), 1024
+            )
         db = partial.sum(0) if ctx.needs_input_grad[2] else None
         return dx, dw, db, None, None
 

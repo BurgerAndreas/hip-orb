@@ -4,6 +4,24 @@ This branch starts at Orb v0.7.0, commit
 `82bab14c091509f2f8f5800ed725dcc596a60953`. Collection uses PyTorch 2.8.0.
 The upstream model implementation stays unchanged. HIP lives in `hip_orb`.
 
+## Dataset split for future training runs
+
+Use the verified 2026-10-22 release of `andreasburger/HIP-OrbMol-OMol25` for new runs.
+Pin revision `8fdc9f01395e926d166cd0eb5d2d4bd275843bb6`.
+The release contains 10,800,000 training geometries and 200,000 validation geometries.
+Training combines the original 10,000,000 geometries with 800,000 former validation geometries.
+The authoritative split is `manifests/split_10p8m_200k.json`.
+Its SHA-256 is `93cac8547be5c61be8e0c1798e48078759d411ec81c69ae0b1f4bcadab737c8d`.
+The completion record is `metadata/release_10p8m_200k_complete.json`.
+All 16 published addition catalogs match the split manifest and its sample counts.
+
+Build separate indexes from this release before launching new runs.
+Set `HIP_TRAIN_INDEX` and `HIP_VALIDATION_INDEX` to those indexes.
+Rebuild batch plans for the new training index.
+The validation pool size is separate from the per-evaluation `validation_samples` limit.
+Preserve the original indexes and batch plans for continuations of existing experiments.
+Compare future models on the same new validation cohort; historical metrics use the previous split.
+
 ## Architecture
 
 Freeze all original parameters, including the energy and charge heads.
@@ -345,3 +363,57 @@ The independent-pair loss path does not support translation projection in the ru
 `radial_cutoff` remains a legacy configuration field for checkpoint compatibility.
 For `log_gaussian` on all-to-all graphs, it does not truncate distances or set Gaussian centers.
 `radial_log_range` controls the initial log-distance centers instead.
+
+### Explicit state conditioning in the final readout
+
+`--readout-conditioning` adds direct molecular charge and spin inputs before the final Hessian block predictions.
+A width-64 MLP reads `(total_charge / 4, (spin_multiplicity - 1) / 4)`.
+It predicts separate channel scales and shifts for the atom and pair readout features.
+The same molecular controls apply to both directed representations of each pair.
+Matrix assembly still enforces symmetry. Analytical Coulomb blocks retain their existing calculation.
+The conditioner starts with zero output, so it initially preserves the unconditioned prediction.
+Its initialization preserves the random state used by the original layers and added Orb processor.
+The existing charge and spin conditioning in Orb remains active.
+The flag defaults to false, and checkpoints record the flag in `head_config`.
+
+`configs/train_2m_dense_edge_adapter_readout_conditioned_lr_1e-3.json` selects this experiment.
+It keeps one dense Orb processor, edge adaptation, pair width 256, and internal MLP width 1024.
+It uses the verified 10.8M/200k split and a fresh two-million-update schedule.
+Sessions stop after 75,000 updates or 90 minutes and resume the same batch plan.
+
+`--validation-sampling uniform` selects geometries uniformly before grouping them by atom count.
+It keeps the validation cohort fixed across evaluations and avoids a truncated shard prefix.
+The conditioned experiment evaluates 10,000 geometries from the 200,000-sample validation pool.
+Existing configurations retain their original validation selection.
+
+### Depth and duration experiments on the 10.8M/200k split
+
+The `cluster_runs/hip_capacity_20261023` deployment selects three fresh edge-adapter runs.
+They train one processor for four million updates, and two processors for two million and four million updates.
+Pair width stays 256; explicit final-readout conditioning stays disabled.
+All runs use the same balanced training plan and fixed uniform 10,000-sample validation subset.
+Each run uses a cosine schedule with its configured total update count.
+Four-million-update runs retain their two-million-update checkpoint.
+These intermediate checkpoints use a different schedule from a completed two-million-update run.
+The historical reference also uses a different split and validation cohort.
+Sessions stop after 50,000 updates or 90 minutes, then submit an automatic continuation.
+
+### Activation range protection for optimized training
+
+Optimized trainable MLPs scale their inputs and hidden activations before FP16 conversion.
+The scales use powers of two; matrix products accumulate in FP32 and restore the scales.
+Weight gradients restore the activation scale as well as the existing gradient scale.
+This prevents intermediate activations from overflowing FP16 in the added Orb processor.
+Parameters and Adam state remain FP32. Model architecture and batch membership stay unchanged.
+Packed training also rejects non-finite gradients before an unscaled optimizer update.
+The runner then saves the unchanged weights, optimizer state, and failing batch for diagnosis.
+Scaled training retains its existing GradScaler overflow handling.
+The `cluster_runs/hip_health_fix_20261023` directory records the failing-batch replay and recovery checks.
+
+The conditioned one-processor run resumes from update 592,640 after the range repair.
+A controlled 2,000-update comparison favors a remaining learning-rate schedule scaled by 0.3.
+Both comparisons use the same next batches and the same 10,000-sample validation subset.
+The recovery sets the cosine peak parameter to 3e-4 from update 590,641 onward.
+The other four capacity and duration runs retain their original schedules.
+The recovered conditioning run therefore has a different learning-rate history from the initial ablation plan.
+The initial 1e-3 configuration template remains available for reproducibility.

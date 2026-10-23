@@ -225,6 +225,30 @@ def collate_samples(samples):
             for key in samples[0]}
 
 
+class UniformSampleBatches:
+    """Choose geometries uniformly before grouping equal-size validation batches."""
+
+    def __init__(self, dataset, count, *, batch_size, max_hessian_elements, seed):
+        if count < 1 or batch_size < 1 or max_hessian_elements < 1:
+            raise ValueError("Uniform validation requires positive sample and batch limits")
+        rng = np.random.default_rng(seed)
+        selected = rng.choice(len(dataset), size=min(count, len(dataset)), replace=False)
+        sizes = dataset.natoms[np.searchsorted(dataset.ptr, selected, side="right") - 1]
+        self.batches = []
+        for n in rng.permutation(np.unique(sizes)):
+            indices = np.sort(selected[sizes == n])
+            cap = min(batch_size, max(1, max_hessian_elements // (3 * int(n)) ** 2))
+            self.batches.extend(indices[start:start + cap].tolist()
+                                for start in range(0, len(indices), cap))
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def set_epoch(self, epoch):
+        # Validation membership and order stay fixed across evaluations.
+        pass
+
+
 class LimitedBatches:
     """Do not prefetch work beyond a bounded optimizer test."""
     def __init__(self, sampler, count):
@@ -301,10 +325,15 @@ def make_loader(dataset, *, workers=0, order="shard", seed=7, pin_memory=True,
                 batch_size=32, max_hessian_elements=2_000_000, rank=0, world_size=1,
                 max_batches=None, max_samples=None, start_batch=0,
                 collate_fn=collate_samples, stratified=False, batch_sampler=None,
-                prefetch_factor=2):
+                prefetch_factor=2, uniform_samples=False):
     if prefetch_factor < 1:
         raise ValueError("Prefetch factor must be positive")
-    if batch_sampler is not None:
+    if uniform_samples:
+        if batch_sampler is not None or max_batches is not None or stratified or rank != 0 or world_size != 1:
+            raise ValueError("Uniform validation requires one process and a sample limit without batch truncation")
+        sampler = UniformSampleBatches(dataset, max_samples or len(dataset),
+                                       batch_size=batch_size, max_hessian_elements=max_hessian_elements, seed=seed)
+    elif batch_sampler is not None:
         if rank != 0 or world_size != 1 or stratified:
             raise ValueError("Custom batch samplers require one process and stratified=False")
         if collate_fn is collate_samples:

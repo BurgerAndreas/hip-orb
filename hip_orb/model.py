@@ -30,6 +30,8 @@ class Features:
     pairs: list[dict[str, torch.Tensor]] | None = None
     geometry: torch.Tensor | None = None
     dense_ordered: bool = False
+    total_charge: torch.Tensor | None = None
+    spin_multiplicity: torch.Tensor | None = None
 
 
 def mlp(inputs, hidden, outputs):
@@ -117,7 +119,8 @@ class HessianHead(nn.Module):
                  radial_features="log", radial_cutoff=12.0, radial_bases=16,
                  pair_residual_layers=0, neighbor_pooling=False, translation_projection=False,
                  context_rounds=1, mlp_hidden=None, all_to_all=False,
-                 radial_log_range=4.0, shared_geometry=False, checkpoint_context=False):
+                 radial_log_range=4.0, shared_geometry=False, checkpoint_context=False,
+                 readout_conditioning=False):
         super().__init__()
         if cutoff is not None and cutoff <= 0:
             raise ValueError("Hessian cutoff must be positive or None")
@@ -187,6 +190,26 @@ class HessianHead(nn.Module):
             self.pair_update = mlp(3 * hidden, mlp_hidden, hidden)
         self.extra_context_rounds = nn.ModuleList(
             ContextRound(hidden, mlp_hidden) for _ in range(context_rounds - 1))
+        if readout_conditioning:
+            self.config["readout_conditioning"] = True
+            # Preserve the initialization of existing layers and later Orb processors.
+            with torch.random.fork_rng(devices=[]):
+                self.readout_conditioner = mlp(2, 64, 2 * (hidden + self.node_head[0].in_features))
+                nn.init.zeros_(self.readout_conditioner[-1].weight)
+                nn.init.zeros_(self.readout_conditioner[-1].bias)
+
+    def _readout_parameters(self, features):
+        if not hasattr(self, "readout_conditioner"):
+            return None
+        if features.total_charge is None or features.spin_multiplicity is None:
+            raise ValueError("Readout conditioning requires total charge and spin multiplicity")
+        if features.total_charge.shape != features.sizes.shape or features.spin_multiplicity.shape != features.sizes.shape:
+            raise ValueError("Readout conditioning requires one charge and spin per molecule")
+        state = torch.stack((features.total_charge, features.spin_multiplicity - 1), dim=-1)
+        state = state.to(device=features.nodes.device, dtype=features.nodes.dtype) / 4
+        return self.readout_conditioner(state).split(
+            (self.config["hidden"], self.config["hidden"],
+             self.node_head[0].in_features, self.node_head[0].in_features), dim=-1)
 
     def forward(self, features: Features, *, residual_only=False, as_tensor=False):
         if as_tensor:
@@ -318,6 +341,15 @@ class HessianHead(nn.Module):
             for context in self.extra_context_rounds:
                 pooled = pool(first, second)
                 node_inputs, first, second = context(node_inputs, pooled, first, second, i, j)
+        conditioning = self._readout_parameters(features)
+        if conditioning is not None:
+            pair_scale, pair_shift, node_scale, node_shift = conditioning
+            owners = torch.arange(len(features.sizes), device=features.nodes.device).repeat_interleave(
+                features.sizes.to(device=features.nodes.device), output_size=len(features.nodes))
+            pair_owners = owners[i]
+            first = first * (1 + pair_scale[pair_owners]) + pair_shift[pair_owners]
+            second = second * (1 + pair_scale[pair_owners]) + pair_shift[pair_owners]
+            node_inputs = node_inputs * (1 + node_scale[owners]) + node_shift[owners]
         first_blocks = self.edge_head(first).reshape(-1, 3, 3)
         second_blocks = self.edge_head(second).reshape(-1, 3, 3)
         blocks = (first_blocks + second_blocks.transpose(-1, -2)) * 0.5
@@ -340,6 +372,7 @@ class HessianHead(nn.Module):
     def _loop_forward(self, features: Features, *, residual_only=False):
         results = []
         offset = 0
+        conditioning = self._readout_parameters(features)
         for molecule, size in enumerate(features.sizes.tolist()):
             n = int(size)
             nodes = features.nodes[offset : offset + n]
@@ -397,7 +430,11 @@ class HessianHead(nn.Module):
                     ),
                     dim=-1,
                 )
-                return self.edge_head(self.pair_adapter(inputs)).reshape(-1, 3, 3)
+                pair_features = self.pair_adapter(inputs)
+                if conditioning is not None:
+                    scale, shift = conditioning[:2]
+                    pair_features = pair_features * (1 + scale[molecule]) + shift[molecule]
+                return self.edge_head(pair_features).reshape(-1, 3, 3)
 
             if self.fuse_pairs:
                 directed = read_pair(torch.cat((i, j)), torch.cat((j, i)),
@@ -407,7 +444,11 @@ class HessianHead(nn.Module):
             else:
                 blocks = (read_pair(i, j, forward_ids if pair is not None else None) +
                           read_pair(j, i, reverse_ids if pair is not None else None).transpose(-1, -2)) * 0.5
-            diagonal = self.node_head(torch.cat((nodes, charges[:, None]), dim=-1)).reshape(n, 3, 3)
+            node_inputs = torch.cat((nodes, charges[:, None]), dim=-1)
+            if conditioning is not None:
+                scale, shift = conditioning[2:]
+                node_inputs = node_inputs * (1 + scale[molecule]) + shift[molecule]
+            diagonal = self.node_head(node_inputs).reshape(n, 3, 3)
             diagonal = (diagonal + diagonal.transpose(-1, -2)) * 0.5
             h = nodes.new_zeros((n, n, 3, 3))
             h[i, j] = blocks
@@ -434,7 +475,7 @@ class HIPOrb(nn.Module):
                  all_to_all=False, orb_initialization="pretrained", orb_message_graph="backbone",
                  orb_rounds=1, orb_combine_backbone_edges=False, orb_feature_adapters="none",
                  radial_log_range=4.0, shared_geometry=False, backbone_layer_mix=0,
-                 checkpoint_context=False):
+                 checkpoint_context=False, readout_conditioning=False):
         super().__init__()
         self.base = base.requires_grad_(False).eval()
         self.adapter = adapter
@@ -442,7 +483,7 @@ class HIPOrb(nn.Module):
                                 radial_features, radial_cutoff, radial_bases,
                                 pair_residual_layers, neighbor_pooling, translation_projection,
                                 context_rounds, mlp_hidden, all_to_all,
-                                radial_log_range, shared_geometry, checkpoint_context)
+                                radial_log_range, shared_geometry, checkpoint_context, readout_conditioning)
         self.head.to(next(base.parameters()))
         if orb_rounds < 1 or (not extra_orb_round and orb_rounds != 1):
             raise ValueError("Orb rounds require an enabled extension and a positive count")
@@ -601,6 +642,8 @@ class HIPOrb(nn.Module):
             pairs,
             geometry,
             dense_graph is not None and getattr(self, "_dense_indexing", False),
+            graph.system_features.get("total_charge"),
+            graph.system_features.get("spin_multiplicity"),
         )
 
     def forward(self, graph):

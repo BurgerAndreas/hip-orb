@@ -180,6 +180,7 @@ def main():
                         help="Validation memory budget; defaults to training budget")
     parser.add_argument("--report-samples", type=int, default=32,
                         help="Maximum per-molecule examples retained in the validation report")
+    parser.add_argument("--validation-sampling", choices=("shard", "uniform"), default="shard")
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--hessian-cutoff", type=float)
     parser.add_argument("--radial-features", choices=("log", "bessel", "log_gaussian"), default="log")
@@ -187,6 +188,7 @@ def main():
     parser.add_argument("--shared-geometry", action="store_true")
     parser.add_argument("--backbone-layer-mix", type=int, default=0)
     parser.add_argument("--checkpoint-context", action="store_true")
+    parser.add_argument("--readout-conditioning", action="store_true")
     parser.add_argument("--radial-cutoff", type=float, default=12.0)
     parser.add_argument("--radial-bases", type=int, default=16)
     parser.add_argument("--pair-residual-layers", type=int, default=0)
@@ -347,7 +349,8 @@ def main():
                              max_hessian_elements=args.validation_max_hessian_elements
                              or args.max_hessian_elements or 8_000_000)
     validation_loader = make_loader(validation, max_batches=args.validation_batches,
-                                    max_samples=args.validation_samples, **validation_common)
+                                    max_samples=args.validation_samples,
+                                    uniform_samples=args.validation_sampling == "uniform", **validation_common)
     train_options = {}
     batching_config = {"mode": args.batching}
     if args.batching == "balanced":
@@ -379,6 +382,7 @@ def main():
                               orb_feature_adapters=args.orb_feature_adapters,
                               radial_log_range=args.radial_log_range, shared_geometry=args.shared_geometry,
                               backbone_layer_mix=args.backbone_layer_mix, checkpoint_context=args.checkpoint_context,
+                              readout_conditioning=args.readout_conditioning,
                               orb_message_graph=args.orb_message_graph, **weights)
     execution_config = configure_execution(model, args.execution_mode)
     model.head._radial_only_backward = args.radial_only_backward
@@ -386,6 +390,7 @@ def main():
     model._compact_pair_loss = args.packed_loss_implementation == "pairs"
     execution_config.update(head_input_fusion=args.head_input_fusion,
                             checkpoint_context=args.checkpoint_context,
+                            readout_conditioning=args.readout_conditioning,
                             linear_input_alignment=args.linear_input_alignment,
                             fused_optimizer=args.fused_optimizer,
                             radial_only_backward=args.radial_only_backward,
@@ -627,6 +632,7 @@ def main():
                   "global_step": global_step, "batch_size": args.batch_size,
                   "validation_batch_size": validation_common["batch_size"],
                   "validation_sample_limit": args.validation_samples,
+                  "validation_sampling": args.validation_sampling,
                   "max_duration_seconds": args.max_duration_seconds,
                   "max_steps": args.max_steps, "validation_every": args.validation_every,
                   "lr_schedule_config": schedule_config,

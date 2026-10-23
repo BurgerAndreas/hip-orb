@@ -280,3 +280,47 @@ def test_dense_extension_compact_loss_preserves_encoder_gradients(context, radia
     ga = torch.autograd.grad(actual, tuple(model.head.parameters()))
     gb = torch.autograd.grad(expected, tuple(reference.head.parameters()))
     for u,v in zip(ga,gb):torch.testing.assert_close(u,v,atol=2e-6,rtol=2e-5)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+def test_nonfinite_backward_preserves_parameters_and_optimizer(monkeypatch, bad_value):
+    from types import SimpleNamespace
+
+    from hip_orb import packed_training as pt
+
+    class BadGradient(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            return value.sum()
+
+        @staticmethod
+        def backward(ctx, gradient):
+            return gradient.reshape(1) * bad_value
+
+    parameter = torch.nn.Parameter(torch.ones(1))
+    head = torch.nn.Module()
+    head.register_parameter("value", parameter)
+    head.translation_projection = False
+    head._batched_forward = lambda *args, **kwargs: (None, None)
+    model = SimpleNamespace(head=head, adapter=None, _compact_pair_loss=True,
+                            features=lambda *args, **kwargs: SimpleNamespace())
+    batch = {"sizes": torch.tensor([1]), "hessian_upper": torch.zeros(6),
+             "rotation": torch.eye(3)}
+    monkeypatch.setattr(pt, "prepare_packed", lambda value, seed: value)
+    monkeypatch.setattr(pt, "packed_graph", lambda *args: None)
+    monkeypatch.setattr(pt, "compact_indices", lambda *args: {})
+    monkeypatch.setattr(pt, "compact_loss", lambda *args: BadGradient.apply(parameter))
+    optimizer = torch.optim.AdamW(head.parameters(), lr=0.01)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    before_parameter = parameter.detach().clone()
+    before_state = copy.deepcopy(optimizer.state_dict())
+    monkeypatch.setattr(optimizer, "step", lambda *a, **k: pytest.fail("Optimizer must not run"))
+    with pytest.raises(FloatingPointError, match="gradients are not finite"):
+        pt.packed_update(model, optimizer, batch, device="cpu")
+    torch.testing.assert_close(parameter, before_parameter)
+    after_state = optimizer.state_dict()
+    assert before_state["param_groups"] == after_state["param_groups"]
+    for key, state in before_state["state"].items():
+        for name, value in state.items():
+            torch.testing.assert_close(after_state["state"][key][name], value)

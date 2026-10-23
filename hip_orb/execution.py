@@ -276,6 +276,7 @@ def configure_execution(
         frozen_backbone_mlp_fp16=frozen_half,
         edge_checkpoint_limit=(650_000 if compact_activations else 300_000) if fast else 0,
         scaled_fp16_gradients=bool((fast and scaled_gradients) or mixture_backward),
+        scaled_fp16_activations=bool(fast and scaled_gradients),
         compact_saved_activations=bool(fast and compact_activations),
         compact_mlp_kernels=bool(fast and compact_activations and scaled_gradients),
         fp16_min_rows=16384 if fast and scaled_gradients else None,
