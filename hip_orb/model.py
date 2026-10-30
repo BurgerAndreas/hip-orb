@@ -1,19 +1,17 @@
 """Frozen backbone, independent Hessian graph, and trainable block readouts."""
 
-from dataclasses import dataclass
 from collections import OrderedDict
 from copy import copy
+from dataclasses import dataclass
 
 import torch
 from torch import nn
-from orb_models.common.models.rbf import BesselBasis
 
-from hip_orb.coulomb import fixed_charge_hessian, fixed_charge_blocks
 from hip_orb.batched_pairs import batch_topology
-from hip_orb.block_layout import layout, assemble
-from hip_orb.translation import project_hessian_list
-from hip_orb.translation import project_translations
+from hip_orb.block_layout import assemble, layout
+from hip_orb.coulomb import fixed_charge_blocks, fixed_charge_hessian
 from hip_orb.radial import make_radial
+from hip_orb.translation import project_hessian_list, project_translations
 
 
 @dataclass
@@ -32,6 +30,7 @@ class Features:
     dense_ordered: bool = False
     total_charge: torch.Tensor | None = None
     spin_multiplicity: torch.Tensor | None = None
+    state_embedding: torch.Tensor | None = None
 
 
 def mlp(inputs, hidden, outputs):
@@ -50,8 +49,26 @@ class ResidualPairLayer(nn.Module):
         self.norm = nn.LayerNorm(hidden)
         self.update = mlp(hidden, mlp_hidden or hidden, hidden)
 
-    def forward(self, features):
-        return features + self.update(self.norm(features))
+    def forward(self, features, state=None):
+        inputs = self.norm(features)
+        if getattr(self, "state_dim", 0):
+            if isinstance(state, tuple):
+                from hip_orb.state_mlp import state_mlp
+
+                return features + state_mlp(self.update, inputs, *state)
+            inputs = torch.cat((inputs, state), dim=-1)
+        return features + self.update(inputs)
+
+
+def append_state_columns(module, state_dim):
+    """Append a state projection before the first activation, initially zero."""
+    original = module[0]
+    widened = nn.Linear(original.in_features + state_dim, original.out_features).to(original.weight)
+    with torch.no_grad():
+        widened.weight.zero_()
+        widened.weight[:, :original.in_features].copy_(original.weight)
+        widened.bias.copy_(original.bias)
+    module[0] = widened
 
 
 def pool_directed_pairs(first, second, i, j, weights, count):
@@ -120,7 +137,8 @@ class HessianHead(nn.Module):
                  pair_residual_layers=0, neighbor_pooling=False, translation_projection=False,
                  context_rounds=1, mlp_hidden=None, all_to_all=False,
                  radial_log_range=4.0, shared_geometry=False, checkpoint_context=False,
-                 readout_conditioning=False):
+                 readout_conditioning=False, readout_state_mode="none",
+                 pair_state_conditioning="none", nonlinear_pair_readout=False):
         super().__init__()
         if cutoff is not None and cutoff <= 0:
             raise ValueError("Hessian cutoff must be positive or None")
@@ -137,6 +155,18 @@ class HessianHead(nn.Module):
         mlp_hidden = hidden if mlp_hidden is None else mlp_hidden
         if hidden < 1 or mlp_hidden < 1:
             raise ValueError("Feature and MLP widths must be positive")
+        if readout_state_mode not in ("none", "concat", "residual"):
+            raise ValueError("Unknown readout state mode")
+        if readout_conditioning and readout_state_mode != "none":
+            raise ValueError("Select either affine conditioning or a readout state mode")
+        self.readout_state_mode = readout_state_mode
+        if pair_state_conditioning not in ("none", "adapter", "residual"):
+            raise ValueError("Unknown pair state conditioning placement")
+        if pair_state_conditioning != "none" and (not readout_conditioning or readout_state_mode != "none"):
+            raise ValueError("Pair state placement requires final affine conditioning and no other state readout")
+        if pair_state_conditioning == "residual" and pair_residual_layers < 1:
+            raise ValueError("Residual state conditioning requires pair residual layers")
+        self.pair_state_conditioning = pair_state_conditioning
         if context_rounds < 1 or (context_rounds > 1 and not neighbor_pooling):
             raise ValueError("Multiple context rounds require neighbor pooling; round count must be positive")
         self.radial_features_type = radial_features
@@ -197,6 +227,81 @@ class HessianHead(nn.Module):
                 self.readout_conditioner = mlp(2, 64, 2 * (hidden + self.node_head[0].in_features))
                 nn.init.zeros_(self.readout_conditioner[-1].weight)
                 nn.init.zeros_(self.readout_conditioner[-1].bias)
+        if readout_state_mode != "none":
+            self.config["readout_state_mode"] = readout_state_mode
+            # Keep shared parameters and subsequent processor initialization identical.
+            with torch.random.fork_rng(devices=[]):
+                if readout_state_mode == "concat":
+                    for module in (self.pair_adapter, self.node_head):
+                        original = module[0]
+                        widened = nn.Linear(original.in_features + latent_dim, original.out_features)
+                        with torch.no_grad():
+                            widened.weight.zero_()
+                            widened.weight[:, :original.in_features].copy_(original.weight)
+                            widened.bias.copy_(original.bias)
+                        module[0] = widened
+                else:
+                    self.pair_state_correction = mlp(hidden + latent_dim, hidden, 9)
+                    self.node_state_correction = mlp(self.node_head[0].in_features + latent_dim, hidden, 9)
+                    for module in (self.pair_state_correction, self.node_state_correction):
+                        nn.init.zeros_(module[-1].weight)
+                        nn.init.zeros_(module[-1].bias)
+        if pair_state_conditioning != "none" or nonlinear_pair_readout:
+            with torch.random.fork_rng(devices=[]):
+                if pair_state_conditioning == "adapter":
+                    append_state_columns(self.pair_adapter, latent_dim)
+                elif pair_state_conditioning == "residual":
+                    for layer in self.pair_residual:
+                        append_state_columns(layer.update, latent_dim)
+                        layer.state_dim = latent_dim
+                if nonlinear_pair_readout:
+                    original = self.edge_head
+                    self.edge_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 9))
+                    with torch.no_grad():
+                        self.edge_head[-1].weight.copy_(original.weight)
+                        self.edge_head[-1].bias.copy_(original.bias)
+            if pair_state_conditioning != "none":
+                self.config["pair_state_conditioning"] = pair_state_conditioning
+            if nonlinear_pair_readout:
+                self.config["nonlinear_pair_readout"] = True
+
+    def _readout_state(self, features):
+        if self.readout_state_mode == "none" and self.pair_state_conditioning == "none":
+            return None
+        state = features.state_embedding
+        if state is None or state.shape != (len(features.sizes), self.config["latent_dim"]):
+            raise ValueError("Readout state mode requires one Orb state embedding per molecule")
+        return state.to(device=features.nodes.device, dtype=features.nodes.dtype)
+
+    def _adapt_pair(self, inputs, state):
+        if self.pair_state_conditioning == "adapter" and isinstance(state, tuple):
+            from hip_orb.state_mlp import state_mlp
+
+            return state_mlp(self.pair_adapter, inputs, *state)
+        if self.readout_state_mode == "concat" or self.pair_state_conditioning == "adapter":
+            inputs = torch.cat((inputs, state), dim=-1)
+        return self.pair_adapter(inputs)
+
+    def _refine_pair(self, inputs, state):
+        if self.pair_state_conditioning == "residual":
+            for layer in self.pair_residual:
+                inputs = layer(inputs, state)
+            return inputs
+        return self.pair_residual(inputs)
+
+    def _read_pair(self, inputs, state):
+        result = self.edge_head(inputs)
+        if self.readout_state_mode == "residual":
+            result = result + self.pair_state_correction(torch.cat((inputs, state), dim=-1))
+        return result
+
+    def _read_node(self, inputs, state):
+        if self.readout_state_mode == "concat":
+            return self.node_head(torch.cat((inputs, state), dim=-1))
+        result = self.node_head(inputs)
+        if self.readout_state_mode == "residual":
+            result = result + self.node_state_correction(torch.cat((inputs, state), dim=-1))
+        return result
 
     def _readout_parameters(self, features):
         if not hasattr(self, "readout_conditioner"):
@@ -243,6 +348,23 @@ class HessianHead(nn.Module):
     def _batched_forward(self, features, *, residual_only=False, as_tensor=False):
         sizes, i, j, forward, reverse, delta, distance = batch_topology(features)
         charges = features.charges.reshape(-1)
+        state = self._readout_state(features)
+        node_state = pair_state = joined_state = None
+        owners = None
+        if state is not None:
+            owners = torch.arange(len(features.sizes), device=features.nodes.device).repeat_interleave(
+                features.sizes.to(device=features.nodes.device), output_size=len(features.nodes))
+            joined = self.fuse_pairs or getattr(self, "_join_radial_pairs", False)
+            rows = len(i) * (2 if joined else 1)
+            if getattr(self, "_fused_state_inputs", False) and rows >= 16384:
+                pair_owners = owners[i]
+                pair_state = (state, pair_owners)
+                joined_state = (state, torch.cat((pair_owners, pair_owners)))
+            else:
+                node_state = state[owners]
+                pair_state = node_state[i]
+                if self.readout_state_mode == "concat" or self.pair_state_conditioning != "none":
+                    joined_state = torch.cat((pair_state, pair_state))
         self.pair_adapter[0]._hip_input_grad_columns = None
         self.pair_adapter[0]._hip_radial_source = None
         if (getattr(self, "_radial_only_backward", False) and self.all_to_all
@@ -275,7 +397,7 @@ class HessianHead(nn.Module):
         if self.fuse_pairs:
             joined = self.pair_inputs(features.nodes, features.edges, charges, i, j,
                                       forward, reverse, delta, distance)
-            directed = self.pair_residual(self.pair_adapter(joined))
+            directed = self._refine_pair(self._adapt_pair(joined, joined_state), joined_state)
             first, second = directed.chunk(2) if len(i) else (directed, directed)
         else:
             unit = delta / distance
@@ -304,11 +426,11 @@ class HessianHead(nn.Module):
                 else:
                     joined = torch.cat((inputs(i, j, forward, unit, first_radial),
                                         inputs(j, i, reverse, -unit, second_radial)))
-                directed = self.pair_residual(self.pair_adapter(joined))
+                directed = self._refine_pair(self._adapt_pair(joined, joined_state), joined_state)
                 first, second = directed.split(len(i)) if len(i) else (directed, directed)
             else:
-                first = self.pair_residual(self.pair_adapter(inputs(i, j, forward, unit, first_radial)))
-                second = self.pair_residual(self.pair_adapter(inputs(j, i, reverse, -unit, second_radial)))
+                first = self._refine_pair(self._adapt_pair(inputs(i, j, forward, unit, first_radial), pair_state), pair_state)
+                second = self._refine_pair(self._adapt_pair(inputs(j, i, reverse, -unit, second_radial), pair_state), pair_state)
         self.pair_adapter[0]._hip_radial_source = None
         node_inputs = torch.cat((features.nodes, charges[:, None]), dim=-1)
         if self.neighbor_pooling:
@@ -342,18 +464,44 @@ class HessianHead(nn.Module):
                 pooled = pool(first, second)
                 node_inputs, first, second = context(node_inputs, pooled, first, second, i, j)
         conditioning = self._readout_parameters(features)
+        fused_affine = (conditioning is not None and getattr(self, "_fused_affine_readout", False)
+                        and len(i) >= getattr(self, "_fused_affine_min_pairs", 4096))
         if conditioning is not None:
             pair_scale, pair_shift, node_scale, node_shift = conditioning
-            owners = torch.arange(len(features.sizes), device=features.nodes.device).repeat_interleave(
-                features.sizes.to(device=features.nodes.device), output_size=len(features.nodes))
+            if owners is None:
+                owners = torch.arange(len(features.sizes), device=features.nodes.device).repeat_interleave(
+                    features.sizes.to(device=features.nodes.device), output_size=len(features.nodes))
             pair_owners = owners[i]
-            first = first * (1 + pair_scale[pair_owners]) + pair_shift[pair_owners]
-            second = second * (1 + pair_scale[pair_owners]) + pair_shift[pair_owners]
-            node_inputs = node_inputs * (1 + node_scale[owners]) + node_shift[owners]
-        first_blocks = self.edge_head(first).reshape(-1, 3, 3)
-        second_blocks = self.edge_head(second).reshape(-1, 3, 3)
+            if not fused_affine:
+                first = first * (1 + pair_scale[pair_owners]) + pair_shift[pair_owners]
+                second = second * (1 + pair_scale[pair_owners]) + pair_shift[pair_owners]
+                node_inputs = node_inputs * (1 + node_scale[owners]) + node_shift[owners]
+        if fused_affine:
+            from hip_orb.affine_readout import affine_readout
+
+            def pair_projection(x):
+                if isinstance(self.edge_head, nn.Linear):
+                    value = affine_readout(x, pair_scale, pair_shift, pair_owners,
+                                           self.edge_head.weight, self.edge_head.bias)
+                else:
+                    layer = self.edge_head[0]
+                    value = affine_readout(x, pair_scale, pair_shift, pair_owners,
+                                           layer.weight, layer.bias, silu=True, compact=True)
+                    value = self.edge_head[2](value)
+                return value.reshape(-1, 3, 3)
+
+            first_blocks, second_blocks = pair_projection(first), pair_projection(second)
+            layer = self.node_head[0]
+            node_values = affine_readout(node_inputs, node_scale, node_shift, owners,
+                                         layer.weight, layer.bias, silu=True, compact=True)
+            for layer in list(self.node_head.children())[2:]:
+                node_values = layer(node_values)
+            diagonal = node_values.reshape(-1, 3, 3)
+        else:
+            first_blocks = self._read_pair(first, pair_state).reshape(-1, 3, 3)
+            second_blocks = self._read_pair(second, pair_state).reshape(-1, 3, 3)
+            diagonal = self._read_node(node_inputs, node_state).reshape(-1, 3, 3)
         blocks = (first_blocks + second_blocks.transpose(-1, -2)) * 0.5
-        diagonal = self.node_head(node_inputs).reshape(-1, 3, 3)
         diagonal = (diagonal + diagonal.transpose(-1, -2)) * 0.5
         if self.cutoff is not None:
             blocks = torch.where((distance < self.cutoff)[:, :, None], blocks, 0)
@@ -373,6 +521,7 @@ class HessianHead(nn.Module):
         results = []
         offset = 0
         conditioning = self._readout_parameters(features)
+        state = self._readout_state(features)
         for molecule, size in enumerate(features.sizes.tolist()):
             n = int(size)
             nodes = features.nodes[offset : offset + n]
@@ -410,7 +559,7 @@ class HessianHead(nn.Module):
                 if pair is not None:
                     forward_ids, reverse_ids = forward_ids[keep], reverse_ids[keep]
 
-            def read_pair(a, b, edge_ids=None, mapping=mapping, nodes=nodes, positions=positions, charges=charges):
+            def read_pair(a, b, edge_ids=None, mapping=mapping, nodes=nodes, positions=positions, charges=charges, molecule=molecule):
                 edge_ids = mapping[a, b] if edge_ids is None else edge_ids
                 present = edge_ids >= 0
                 edge = nodes.new_zeros((len(a), nodes.shape[-1]))
@@ -430,11 +579,12 @@ class HessianHead(nn.Module):
                     ),
                     dim=-1,
                 )
-                pair_features = self.pair_adapter(inputs)
+                pair_state = None if state is None else state[molecule].expand(len(a), -1)
+                pair_features = self._adapt_pair(inputs, pair_state)
                 if conditioning is not None:
                     scale, shift = conditioning[:2]
                     pair_features = pair_features * (1 + scale[molecule]) + shift[molecule]
-                return self.edge_head(pair_features).reshape(-1, 3, 3)
+                return self._read_pair(pair_features, pair_state).reshape(-1, 3, 3)
 
             if self.fuse_pairs:
                 directed = read_pair(torch.cat((i, j)), torch.cat((j, i)),
@@ -448,7 +598,8 @@ class HessianHead(nn.Module):
             if conditioning is not None:
                 scale, shift = conditioning[2:]
                 node_inputs = node_inputs * (1 + scale[molecule]) + shift[molecule]
-            diagonal = self.node_head(node_inputs).reshape(n, 3, 3)
+            node_state = None if state is None else state[molecule].expand(n, -1)
+            diagonal = self._read_node(node_inputs, node_state).reshape(n, 3, 3)
             diagonal = (diagonal + diagonal.transpose(-1, -2)) * 0.5
             h = nodes.new_zeros((n, n, 3, 3))
             h[i, j] = blocks
@@ -475,7 +626,8 @@ class HIPOrb(nn.Module):
                  all_to_all=False, orb_initialization="pretrained", orb_message_graph="backbone",
                  orb_rounds=1, orb_combine_backbone_edges=False, orb_feature_adapters="none",
                  radial_log_range=4.0, shared_geometry=False, backbone_layer_mix=0,
-                 checkpoint_context=False, readout_conditioning=False):
+                 checkpoint_context=False, readout_conditioning=False, readout_state_mode="none",
+                 pair_state_conditioning="none", nonlinear_pair_readout=False):
         super().__init__()
         self.base = base.requires_grad_(False).eval()
         self.adapter = adapter
@@ -483,7 +635,8 @@ class HIPOrb(nn.Module):
                                 radial_features, radial_cutoff, radial_bases,
                                 pair_residual_layers, neighbor_pooling, translation_projection,
                                 context_rounds, mlp_hidden, all_to_all,
-                                radial_log_range, shared_geometry, checkpoint_context, readout_conditioning)
+                                radial_log_range, shared_geometry, checkpoint_context, readout_conditioning,
+                                readout_state_mode, pair_state_conditioning, nonlinear_pair_readout)
         self.head.to(next(base.parameters()))
         if orb_rounds < 1 or (not extra_orb_round and orb_rounds != 1):
             raise ValueError("Orb rounds require an enabled extension and a positive count")
@@ -511,7 +664,7 @@ class HIPOrb(nn.Module):
                 self.head.backbone_mixture = FrozenLayerMixture(self.head.config["latent_dim"], backbone_layer_mix)
                 self.head.config["backbone_layer_mix"] = backbone_layer_mix
             # Register with the head so its optimizer and checkpoints include this layer.
-            from hip_orb.orb_extension import make_orb_processor, DenseOrbEdgeEncoder
+            from hip_orb.orb_extension import DenseOrbEdgeEncoder, make_orb_processor
             if orb_message_graph not in ("backbone", "hessian"):
                 raise ValueError("Orb message graph must be backbone or hessian")
             if orb_message_graph == "hessian" and not all_to_all:
@@ -589,6 +742,19 @@ class HIPOrb(nn.Module):
                 conditioner = getattr(self.base.model, "conditioner", None)
                 if conditioner is not None:
                     cond_nodes, cond_edges = conditioner(dense_graph if dense_graph is not None else graph)
+            state_embedding = None
+            if self.head.readout_state_mode != "none" or self.head.pair_state_conditioning != "none":
+                readout_nodes = cond_nodes
+                if readout_nodes is None:
+                    conditioner = getattr(self.base.model, "conditioner", None)
+                    if conditioner is None:
+                        raise ValueError("Readout state mode requires an Orb state conditioner")
+                    readout_nodes, _ = conditioner(graph)
+                if readout_nodes is None:
+                    raise ValueError("Readout state mode requires Orb node state embeddings")
+                counts = graph.n_node.to(device=readout_nodes.device)
+                offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)[:-1]))
+                state_embedding = readout_nodes[offsets].detach()
         nodes, edges = out["node_features"].detach(), out["edge_features"].detach()
         if hasattr(self.head, "backbone_mixture"):
             nodes, edges = self.head.backbone_mixture(captured)
@@ -644,6 +810,7 @@ class HIPOrb(nn.Module):
             dense_graph is not None and getattr(self, "_dense_indexing", False),
             graph.system_features.get("total_charge"),
             graph.system_features.get("spin_multiplicity"),
+            state_embedding,
         )
 
     def forward(self, graph):

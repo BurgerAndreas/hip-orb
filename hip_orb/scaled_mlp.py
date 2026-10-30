@@ -75,7 +75,31 @@ def _product(a, b, maximum, activation_maximum=None):
     return out
 
 
-def _activation(a, w, b, maximum):
+@triton.jit
+def _scaled_activation(PRE, MAXIMUM, BIAS, SAVED, MAX, SIZE, N: tl.constexpr,
+                       HAS_BIAS: tl.constexpr, BLOCK: tl.constexpr):
+    ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    scale = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.load(MAXIMUM), 1e-30) / 1024.0)))
+    z = tl.load(PRE + ids, ids < SIZE, 0) * scale
+    if HAS_BIAS:
+        z += tl.load(BIAS + ids % N, ids < SIZE, 0)
+    value = z * tl.sigmoid(z)
+    tl.store(PRE + ids, value, ids < SIZE)
+    tl.store(SAVED + ids, tl.minimum(tl.maximum(z, -80.0), 80.0), ids < SIZE)
+    tl.store(MAX + tl.program_id(0), tl.max(tl.where(ids < SIZE, tl.abs(value), 0.0), 0))
+
+
+def _activation(a, w, b, maximum, *, fused=True):
+    if fused:
+        pre = torch.mm(a, w.T, out_dtype=torch.float32)
+        saved = torch.empty_like(pre, dtype=torch.float16)
+        maxima = pre.new_empty((triton.cdiv(pre.numel(), 1024),))
+        _scaled_activation[(len(maxima),)](pre, maximum, b, saved, maxima, pre.numel(), pre.shape[1],
+                                          b is not None, 1024, enable_fp_fusion=False)
+        activation_maximum = maxima.amax()
+        q = torch.empty_like(pre, dtype=torch.float16)
+        _scale_cast[(len(maxima),)](pre, activation_maximum, q, pre.numel(), 1024)
+        return q, saved, activation_maximum
     pre = _product(a, w.T, maximum)
     h = torch.empty_like(pre)
     saved = torch.empty_like(pre, dtype=torch.float16)
@@ -88,7 +112,7 @@ def _activation(a, w, b, maximum):
 
 class _MLP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w1, b1, w2, b2, w3, b3, fused_reductions):
+    def forward(ctx, x, w1, b1, w2, b2, w3, b3, fused_reductions, fused_activations):
         ctx.fused_reductions = fused_reductions
         width = x.shape[-1]
         pad = (-width) % 16
@@ -103,12 +127,12 @@ class _MLP(torch.autograd.Function):
             a = x.reshape(-1, width)
             if pad:
                 a = F.pad(a, (0, pad))
-        a, sa, _ = _quantize(a.contiguous())
+        a, sa, _ = _quantize(a.contiguous(), fused_parts=fused_activations)
         wh1 = F.pad(w1.half(), (0, pad)) if pad else w1.half()
         wh2 = w2.half()
         wh3 = w3.half()
-        h1, p1, s1 = _activation(a, wh1, b1, sa)
-        h2, p2, s2 = _activation(h1, wh2, b2, s1)
+        h1, p1, s1 = _activation(a, wh1, b1, sa, fused=fused_activations)
+        h2, p2, s2 = _activation(h1, wh2, b2, s1, fused=fused_activations)
         y = _product(h2, wh3.T, s2)
         if b3 is not None:
             y.add_(b3)
@@ -131,7 +155,7 @@ class _MLP(torch.autograd.Function):
                         create_graph=True,
                     )
                 )
-            return tuple(next(values) if need else None for need in needs) + (None,)
+            return tuple(next(values) if need else None for need in needs) + (None, None)
         q3, s3, db3 = _quantize(g.reshape(-1, len(w3)).contiguous(), need_bias=needs[6],
                                   fused_parts=ctx.fused_reductions)
         dw3 = _product(q3.T, h2, s3, sh2) if needs[5] else None
@@ -146,17 +170,17 @@ class _MLP(torch.autograd.Function):
         del raw1
         dw1 = _product(q1.T, a, s1, sa)[:, : x.shape[-1]].contiguous() if needs[1] else None
         dx = _product(q1, wh1, s1)[:, : x.shape[-1]].reshape(x.shape) if needs[0] else None
-        return dx, dw1, db1, dw2, db2, dw3, db3, None
+        return dx, dw1, db1, dw2, db2, dw3, db3, None, None
 
 
-def scaled_mlp(x, w1, b1, w2, b2, w3, b3, *, fused_reductions=True):
+def scaled_mlp(x, w1, b1, w2, b2, w3, b3, *, fused_reductions=True, fused_activations=True):
     if x.is_cuda and x.dtype == w1.dtype == torch.float32 and x.numel():
-        return _MLP.apply(x, w1, b1, w2, b2, w3, b3, fused_reductions)
+        return _MLP.apply(x, w1, b1, w2, b2, w3, b3, fused_reductions, fused_activations)
     return F.linear(F.silu(F.linear(F.silu(F.linear(x, w1, b1)), w2, b2)), w3, b3)
 
 
 @contextmanager
-def scaled_mlp_layers(model, *, fused_reductions=True):
+def scaled_mlp_layers(model, *, fused_reductions=True, fused_activations=True):
     changed = []
     try:
         for name, module in model.named_modules():
@@ -181,7 +205,7 @@ def scaled_mlp_layers(model, *, fused_reductions=True):
                 if x.numel() // x.shape[-1] < 16384:
                     return original(x)
                 return scaled_mlp(x, a.weight, a.bias, b.weight, b.bias, c.weight, c.bias,
-                                  fused_reductions=fused_reductions)
+                                  fused_reductions=fused_reductions, fused_activations=fused_activations)
 
             module.forward = MethodType(forward, module)
         yield

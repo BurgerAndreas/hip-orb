@@ -72,6 +72,9 @@ def configure_execution(
     backward_input_fp32=None,
     shared_projection=True,
     fused_reductions=True,
+    fused_affine=True,
+    fused_state_inputs=True,
+    fused_mlp_activations=True,
 ):
     """Select execution without changing parameters, graph rules, or checkpoints.
 
@@ -196,6 +199,16 @@ def configure_execution(
         and head.shared_geometry
     )
     head._project_geometry_first = project_shared
+    head._fused_affine_readout = bool(fast and fused_affine and hasattr(head, "readout_conditioner"))
+    head._fused_state_inputs = bool(fast and fused_state_inputs
+                                  and head.pair_state_conditioning in ("adapter", "residual")
+                                  and head.config["hidden"] >= 128
+                                  and scaled_gradients and compact_activations)
+    head.pair_adapter._state_fused_reductions = fused_reductions
+    head.pair_adapter._state_fused_activations = fused_mlp_activations
+    for layer in head.pair_residual:
+        layer.update._state_fused_reductions = fused_reductions
+        layer.update._state_fused_activations = fused_mlp_activations
     frozen_half = False
     if fast:
         from hip_orb.fused_linear_silu import fused_linear_silu_layers
@@ -205,7 +218,8 @@ def configure_execution(
         stack = ExitStack()
         try:
             if scaled_gradients and compact_activations:
-                stack.enter_context(scaled_mlp_layers(model, fused_reductions=fused_reductions))
+                stack.enter_context(scaled_mlp_layers(model, fused_reductions=fused_reductions,
+                                                       fused_activations=fused_mlp_activations))
             stack.enter_context(
                 fused_linear_silu_layers(
                     model, scaled=scaled_gradients, compact=compact_activations
@@ -295,6 +309,10 @@ def configure_execution(
             and fused_reductions
         ),
         project_shared_geometry_first=project_shared,
+        fused_affine_readout=head._fused_affine_readout,
+        fused_affine_min_pairs=4096 if head._fused_affine_readout else None,
+        fused_state_inputs=head._fused_state_inputs,
+        fused_mlp_activations=bool(fast and scaled_gradients and compact_activations and fused_mlp_activations),
     )
     if mixture_backward:
         result["head_precision"] = precision + (

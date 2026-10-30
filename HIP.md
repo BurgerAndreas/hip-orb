@@ -417,3 +417,116 @@ The recovery sets the cosine peak parameter to 3e-4 from update 590,641 onward.
 The other four capacity and duration runs retain their original schedules.
 The recovered conditioning run therefore has a different learning-rate history from the initial ablation plan.
 The initial 1e-3 configuration template remains available for reproducibility.
+
+### Alternative charge and spin readouts
+
+`--readout-state-mode concat` appends the frozen Orb state encoding to the pair adapter and atom readout inputs.
+The encoding contains 128 charge channels and 128 spin channels.
+The added input weights start at zero. Existing weights retain their original initialization.
+
+`--readout-state-mode residual` adds separate atom and pair correction branches.
+Each branch reads local features and the same Orb state encoding.
+Each branch has two width-256 hidden layers. Its final projection starts at zero.
+Both modes preserve the initial predictions, matrix symmetry, and native Orb conditioning.
+These modes cannot combine with the affine `--readout-conditioning` option.
+
+The `cluster_runs/hip_state_readouts_20261024` deployment compares these modes with two trainable Orb processors.
+Both runs use two million updates, pair width 256, and an initial learning rate of 1e-3.
+They use the verified 10.8M/200k split and the same fixed uniform 10,000-sample validation subset.
+They retain the existing balanced batch sequence and optimized training kernels.
+On 24 October, these runs replace both four-million-update duration experiments.
+The cancelled experiments retain their checkpoints.
+
+The same deployment also includes one-processor versions of both state readouts.
+Their configurations change only `orb_rounds` from two to one.
+They start fresh and retain the same two-million-update schedule, batch sequence, and validation subset.
+`train_one.sbatch` launches these versions and submits their automatic continuations.
+
+### Fused affine readout execution
+
+Optimized execution fuses charge and spin scaling and shifting into the pair projection.
+It also fuses conditioning, the first atom projection, and its SiLU activation.
+The kernels read each molecule's controls directly and avoid materializing conditioned features during forward execution.
+Backward execution combines feature scaling with FP32 molecular reductions for the scale and shift gradients.
+Weight gradients reconstruct conditioned inputs only when needed.
+Parameters, conditioner gradients, and accumulated matrix products remain FP32.
+Compact atom preactivations use the existing bounded FP16 storage policy.
+The kernels use three TF32 products for each FP32 forward matrix product.
+Their rounding can differ from the existing single-TF32 execution path.
+Model architecture, parameter names, and checkpoint formats remain unchanged.
+
+`configure_execution(model, 'optimized', fused_affine=False)` selects the previous path for matched comparisons.
+Execution reports record `fused_affine_readout`.
+Eager execution, CPU execution, and deterministic execution retain the reference operations.
+
+Matched H100 checks reduce complete step time by 6.0%, 26.4%, and 33.8% for 64-, 250-, and 350-atom batches.
+An 11-atom batch shows no material change.
+The same completed checkpoint differs by 0.00584% in RMSE on 1,000 fixed uniform validation geometries.
+The `cluster_runs/hip_affine_fusion_20261027` deployment records the GPU tests, timing results, and validation comparison.
+The fused kernels support pair widths 256 and 512 without changing the Orb backbone width.
+The GPU suite checks both widths, including complete head outputs and conditioner gradients.
+Batches with fewer than 4,096 atom pairs retain the previous path to avoid small-batch overhead.
+
+Orb's native state conditioning uses additive projections rather than learned feature scales.
+It concatenates 128 charge embedding channels and 128 spin embedding channels.
+Each message layer projects this encoding and adds it to atom features before message calculations.
+Edges receive charge and spin information through those atom features.
+The Hessian readout's affine conditioner separately predicts multiplicative scales and additive shifts.
+
+### Pair-conditioning placement screen
+
+The `cluster_runs/hip_pair_conditioning_200k_20261027` deployment compares four fresh width-512 models.
+All retain two Orb processors, Bessel features, edge adaptation, and final affine conditioning.
+The control keeps the linear pair projection.
+`--pair-state-conditioning adapter` adds the native Orb state projection before the first pair-adapter activation.
+`--pair-state-conditioning residual` adds it before the first activation in each pair residual MLP, after local-feature normalization.
+The state columns start at zero and preserve the control's initial predictions and shared parameter initialization.
+`--nonlinear-pair-readout` replaces the final pair projection with Linear(512,512), SiLU, and Linear(512,9).
+Its extra hidden layer uses standard initialization. Its final weights copy the original pair projection.
+All four use the same saved batch sequence, seed, and 200k-update cosine schedule.
+They validate on the fixed uniform 10k cohort every 50k updates and at completion.
+
+### Prospective MLP memory-traffic improvements
+
+The `cluster_runs/hip_pair_speed_20261027` deployment profiles saved screening checkpoints in separate GPU jobs.
+The running 200k experiments retain their original immutable runtime.
+Optimized full MLPs fuse scale restoration, bias, SiLU, saved-activation clipping, and activation maxima.
+Input quantization avoids a full FP32 absolute-value temporary.
+Earlier state-conditioning paths gather frozen state values directly into the existing scaled FP16 input buffer.
+They avoid repeated FP32 state tensors and compute input gradients only for local feature columns.
+The concatenated first-layer weights and optimizer layout remain unchanged.
+Small MLPs and trainable state encodings retain their previous path.
+The precision policy, FP32 parameters, and accumulated FP32 gradients remain unchanged.
+`configure_execution(..., fused_mlp_activations=False, fused_state_inputs=False)` selects the prior path for matched comparisons.
+
+The H100 benchmark passed 22 GPU tests and compared 16 complete-update cases at pair width 512.
+For 64-atom batches, update times fell by 13.4–16.2%.
+For 250–350-atom batches, update times fell by 16.4–19.7%.
+The largest state-input case saved 4.40 GiB of peak allocated memory.
+Tiny 11-atom batches showed little benefit.
+Validation RMSE changed by less than 0.001% across four checkpoints and 256 fixed geometries each.
+These numerical checks do not establish final accuracy after long training.
+See the deployment README and `benchmark.json` for matched timing and correctness measurements.
+
+### CPark learning-rate comparison
+
+`cluster_runs/hip_cpark_lr_20261025` contains an 18-run comparison at 200,000 updates.
+It compares the four concatenation and correction models, the unconditioned two-processor model, and the affine-conditioned two-processor model.
+Each model uses peak learning rates of 1e-4, 3e-4, and 1e-3.
+All runs start fresh with a 30,000-update warmup and cosine decay to zero at 200,000 updates.
+They retain the original batch sequence, the 10.8M/200k split, and the same 10,000 validation samples.
+Validation occurs every 50,000 updates and at completion.
+The deployment stages immutable labels on CPark and checks all six models before training.
+Initial training array: 37349113, tasks 0 through 17.
+Each unfinished task resumes its checkpoint in a new allocation.
+
+### H100 width-512 affine learning-rate comparison
+
+`cluster_runs/hip_orb512_lr_20261027` launches three fresh two-million-update runs.
+They use two Orb processors, pair width 512, internal width 1024, and fused final affine conditioning.
+They retain 16 trainable Bessel functions, log distance, the 12 Angstrom radial scale, and the edge adapter.
+Peak learning rates are 3e-4, 1e-3, and 3e-3, with 15% warmup and cosine decay.
+All use the verified 10.8M/200k split, seed 7, and the same saved batch sequence.
+They validate every 400,000 updates and at completion on the fixed uniform 10,000-sample cohort.
+The immutable runtime matches the completed width-512 speed and correctness benchmark.
+Preflight checks GPU updates, fused execution, validation, and checkpoint resume before releasing the training jobs.

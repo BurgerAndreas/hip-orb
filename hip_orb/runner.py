@@ -189,6 +189,9 @@ def main():
     parser.add_argument("--backbone-layer-mix", type=int, default=0)
     parser.add_argument("--checkpoint-context", action="store_true")
     parser.add_argument("--readout-conditioning", action="store_true")
+    parser.add_argument("--readout-state-mode", choices=("none", "concat", "residual"), default="none")
+    parser.add_argument("--pair-state-conditioning", choices=("none", "adapter", "residual"), default="none")
+    parser.add_argument("--nonlinear-pair-readout", action="store_true")
     parser.add_argument("--radial-cutoff", type=float, default=12.0)
     parser.add_argument("--radial-bases", type=int, default=16)
     parser.add_argument("--pair-residual-layers", type=int, default=0)
@@ -383,6 +386,9 @@ def main():
                               radial_log_range=args.radial_log_range, shared_geometry=args.shared_geometry,
                               backbone_layer_mix=args.backbone_layer_mix, checkpoint_context=args.checkpoint_context,
                               readout_conditioning=args.readout_conditioning,
+                              readout_state_mode=args.readout_state_mode,
+                              pair_state_conditioning=args.pair_state_conditioning,
+                              nonlinear_pair_readout=args.nonlinear_pair_readout,
                               orb_message_graph=args.orb_message_graph, **weights)
     execution_config = configure_execution(model, args.execution_mode)
     model.head._radial_only_backward = args.radial_only_backward
@@ -391,6 +397,9 @@ def main():
     execution_config.update(head_input_fusion=args.head_input_fusion,
                             checkpoint_context=args.checkpoint_context,
                             readout_conditioning=args.readout_conditioning,
+                            readout_state_mode=args.readout_state_mode,
+                            pair_state_conditioning=args.pair_state_conditioning,
+                            nonlinear_pair_readout=args.nonlinear_pair_readout,
                             linear_input_alignment=args.linear_input_alignment,
                             fused_optimizer=args.fused_optimizer,
                             radial_only_backward=args.radial_only_backward,

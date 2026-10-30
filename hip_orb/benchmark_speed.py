@@ -31,7 +31,8 @@ def head_options(config):
              "translation_projection", "context_rounds", "mlp_hidden", "all_to_all",
              "orb_initialization", "orb_message_graph", "orb_rounds", "orb_combine_backbone_edges",
              "orb_feature_adapters", "radial_log_range", "shared_geometry", "backbone_layer_mix",
-             "checkpoint_context", "readout_conditioning")
+             "checkpoint_context", "readout_conditioning", "readout_state_mode",
+             "pair_state_conditioning", "nonlinear_pair_readout")
     options = {name: config[name] for name in names if name in config}
     options["cutoff"] = config.get("hessian_cutoff")
     return options

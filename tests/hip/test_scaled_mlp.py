@@ -4,6 +4,27 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize("width", [512, 791])
+@pytest.mark.parametrize("scale", [1.0, 1e-12, 1e5])
+def test_fused_activation_passes_preserve_exact_operands_and_gradients(width, scale):
+    from hip_orb.scaled_mlp import scaled_mlp
+
+    torch.manual_seed(58)
+    x = (torch.randn(513, width, device="cuda") * scale).requires_grad_()
+    params = [x]
+    for inputs, outputs in ((width,128),(128,128),(128,256)):
+        params.extend(((torch.randn(outputs,inputs,device="cuda")/inputs**0.5).requires_grad_(),
+                       torch.randn(outputs,device="cuda",requires_grad=True)))
+    a = scaled_mlp(*params, fused_activations=False)
+    b = scaled_mlp(*params, fused_activations=True)
+    torch.testing.assert_close(a,b,atol=0,rtol=0)
+    g = torch.randn_like(a) * 1e-12
+    aa = torch.autograd.grad(a,params,g)
+    bb = torch.autograd.grad(b,params,g)
+    for av,bv in zip(aa,bb,strict=True):
+        torch.testing.assert_close(av,bv,atol=0,rtol=0)
+
+
 @pytest.mark.parametrize(
     "width,scale",
     [
