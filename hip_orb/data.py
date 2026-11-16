@@ -353,7 +353,8 @@ def make_loader(dataset, *, workers=0, order="shard", seed=7, pin_memory=True,
             raise ValueError("Starting batch must be nonnegative")
         sampler = SkipBatches(sampler, start_batch)
     kwargs = dict(dataset=dataset, batch_sampler=sampler, collate_fn=collate_fn,
-                  num_workers=workers, pin_memory=pin_memory)
+                  num_workers=workers, pin_memory=pin_memory,
+                  generator=torch.Generator().manual_seed(seed))
     if workers:
         kwargs.update(persistent_workers=True, prefetch_factor=prefetch_factor, multiprocessing_context="spawn")
     return DataLoader(**kwargs)

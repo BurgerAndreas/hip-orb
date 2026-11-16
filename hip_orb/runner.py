@@ -24,6 +24,7 @@ from hip_orb.model import HIPOrb
 from hip_orb.packed_training import collate_packed_compact, packed_update
 from hip_orb.preparation import prepare_batch
 from hip_orb.schedules import learning_rate
+from hip_orb.session_stop import UpdateBoundary
 
 
 def timed_batches(loader, timing):
@@ -163,6 +164,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--session-steps", type=int)
+    parser.add_argument("--stop-request-file", type=Path,
+                        help="Save and stop at an update boundary when this file exists; remove before resume")
     parser.add_argument("--max-duration-seconds", type=float,
                         help="Stop updates after this elapsed time, including periodic validation")
     parser.add_argument("--session-duration-seconds", type=float,
@@ -457,6 +460,12 @@ def main():
             for group in saved["optimizer"]["param_groups"]:
                 group.update(fused=args.fused_optimizer, foreach=None)
             optimizer.load_state_dict(saved["optimizer"])
+        if saved.get("seed", args.seed) != args.seed:
+            raise ValueError("Checkpoint training seed differs")
+        if "torch_rng_state" in saved:
+            torch.set_rng_state(saved["torch_rng_state"].cpu())
+        if saved.get("cuda_rng_state") is not None and args.device.startswith("cuda"):
+            torch.cuda.set_rng_state(saved["cuda_rng_state"].cpu(), device=args.device)
         global_step = saved.get("global_step", 0)
         previous_elapsed = saved.get("training_elapsed_s", 0.0)
         last_validation_elapsed = saved.get("last_validation_elapsed_s", 0.0)
@@ -478,23 +487,33 @@ def main():
     started = time.perf_counter()
     current_epoch = resume_epoch
     session_start_step = global_step
+    stop_boundary = UpdateBoundary(args.stop_request_file)
 
     def elapsed():
         return previous_elapsed + time.perf_counter() - started
 
+    def check_limits():
+        total = ((args.max_steps is not None and global_step >= args.max_steps)
+                 or (args.max_duration_seconds is not None
+                     and elapsed() >= args.max_duration_seconds))
+        session = ((args.session_steps is not None
+                    and global_step - session_start_step >= args.session_steps)
+                   or (args.session_duration_seconds is not None
+                       and time.perf_counter() - started >= args.session_duration_seconds))
+        # Collectives occur only at matching update/loop boundaries. Repeated
+        # bookkeeping queries below read this agreed decision without collectives.
+        stop_boundary.reached(session, total_limit=total)
+
     def total_limit_reached():
-        return ((args.max_steps is not None and global_step >= args.max_steps)
-                or (args.max_duration_seconds is not None
-                    and elapsed() >= args.max_duration_seconds))
+        return stop_boundary.total_limited
 
     def limit_reached():
-        return (total_limit_reached() or (args.session_steps is not None
-                and global_step - session_start_step >= args.session_steps)
-                or (args.session_duration_seconds is not None
-                and time.perf_counter() - started >= args.session_duration_seconds))
+        return stop_boundary.stopped
 
     def save_checkpoint():
-        checkpoint = {"head": model.head.state_dict(), "head_config": model.head.config,
+        checkpoint = {"seed": args.seed, "torch_rng_state": torch.get_rng_state(),
+                      "cuda_rng_state": torch.cuda.get_rng_state(args.device) if args.device.startswith("cuda") else None,
+                      "head": model.head.state_dict(), "head_config": model.head.config,
                       "regularization_config": regularization_config,
                       "batching_config": batching_config,
                       "augmentation_config": augmentation_config,
@@ -543,6 +562,7 @@ def main():
             timing = {"loader_s": 0.0, "update_s": 0.0, "samples": 0, "updates": 0}
             window_started = time.perf_counter()
             for batch in timed_batches(train_loader, timing):
+                check_limits()
                 if limit_reached():
                     break
                 update_lr = learning_rate(global_step + 1, args.lr, args.lr_schedule,
@@ -581,6 +601,7 @@ def main():
                                       "grad_scale": scaler.get_scale(), "skipped_updates": skipped_updates}), flush=True)
                     continue
                 global_step += 1
+                check_limits()
                 # Keep bounded diagnostics, not a list proportional to a long run.
                 if len(training_batch_sizes) < 1024:
                     training_batch_sizes.append(size)
@@ -596,7 +617,7 @@ def main():
                                       "window_mean_batch_size": timing["samples"] / timing["updates"]}), flush=True)
                     timing.update(loader_s=0.0, update_s=0.0, samples=0, updates=0)
                     window_started = time.perf_counter()
-                if not total_limit_reached() and (not limit_reached() or args.session_steps is not None) and (
+                if not total_limit_reached() and (not limit_reached() or (args.session_steps is not None and not stop_boundary.requested)) and (
                     (args.validation_every and global_step % args.validation_every == 0)
                     or (args.validation_every_seconds
                         and now - last_validation_elapsed >= args.validation_every_seconds)
@@ -621,8 +642,9 @@ def main():
                 break
             current_epoch, epoch_batches = epoch + 1, 0
         # Always exercise final validation, even if a periodic check just ran.
+        check_limits()
         training_elapsed_s = elapsed()
-        session_paused = limit_reached() and not total_limit_reached()
+        session_paused = limit_reached() and (stop_boundary.requested or not total_limit_reached())
         save_checkpoint()
         final = ({"validation": {}, "validation_samples": 0} if session_paused else
                  validate(model, validation_loader, args.device, args.report_samples))
@@ -654,11 +676,15 @@ def main():
                   "frozen_state_unchanged": unchanged, "separate_validation_set": True,
                   "final_validation_completed": not session_paused,
                   "training_complete": not session_paused,
+                  "stop_reason": "requested" if stop_boundary.requested else ("session_limit" if session_paused else "complete"),
+                  "auto_continue": session_paused and not stop_boundary.requested,
                   "checkpoint_readable": bool(saved["head"]),
                   "orb_commit": ORB_COMMIT, "elapsed_s": elapsed(),
                   "peak_allocated_bytes": torch.cuda.max_memory_allocated()
                   if args.device.startswith("cuda") else None}
-        (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        report_temporary = args.output / "report.tmp.json"
+        report_temporary.write_text(json.dumps(report, indent=2) + "\n")
+        report_temporary.replace(args.output / "report.json")
         print(json.dumps({key: report[key] for key in ("global_step", "validation", "validation_samples",
                          "final_validation_completed", "checkpoint_readable")}), flush=True)
     finally:
