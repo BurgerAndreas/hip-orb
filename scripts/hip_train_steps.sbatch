@@ -15,6 +15,11 @@ fi
 export HIP_RESUME_CHECKPOINT="$HIP_TRAIN_OUTPUT/head.pt"
 unset HIP_SESSION_SECONDS
 bash "$PWD/scripts/hip_train.sbatch"
+# A requested checkpoint is a user pause, not an automatic session continuation.
+if "$HIP_LOADER_PYTHON" -c 'import json,os,pathlib,sys; r=json.loads((pathlib.Path(os.environ["HIP_TRAIN_OUTPUT"])/"report.json").read_text()); sys.exit(0 if r.get("stop_reason") == "requested" else 1)'; then
+  echo 'Checkpoint saved on request; no continuation submitted.'
+  exit 0
+fi
 if "$HIP_LOADER_PYTHON" -c 'import json,os,pathlib,sys; r=json.loads((pathlib.Path(os.environ["HIP_TRAIN_OUTPUT"])/"report.json").read_text()); sys.exit(0 if r["training_complete"] else 1)'; then
   echo 'Training and final validation completed.'
 else

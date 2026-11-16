@@ -484,3 +484,5 @@ Orb models are licensed under the Apache License, Version 2.0. Please see the [L
 ### Community
 
 Please join the discussion on Discord by following [this](https://discord.gg/SyD6vWSSTB) link.
+
+HIP training runtime: [setup, cache, conditioning and checkpoint requests](docs/training_runtime.md).

@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 hip = ["h5py>=3.10"]
+cache = ["h5py>=3.10", "huggingface-hub>=0.26,<2"]
 torchsim = ["torch-sim-atomistic>=0.6.0"]
 
 [project.scripts]
