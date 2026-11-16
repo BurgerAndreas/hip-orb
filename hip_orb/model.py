@@ -473,9 +473,9 @@ class HessianHead(nn.Module):
                     features.sizes.to(device=features.nodes.device), output_size=len(features.nodes))
             pair_owners = owners[i]
             if not fused_affine:
-                first = first * (1 + pair_scale[pair_owners]) + pair_shift[pair_owners]
-                second = second * (1 + pair_scale[pair_owners]) + pair_shift[pair_owners]
-                node_inputs = node_inputs * (1 + node_scale[owners]) + node_shift[owners]
+                first = first * (1 + _conditioning_rows(self, pair_scale, pair_owners, len(features.sizes))) + _conditioning_rows(self, pair_shift, pair_owners, len(features.sizes))
+                second = second * (1 + _conditioning_rows(self, pair_scale, pair_owners, len(features.sizes))) + _conditioning_rows(self, pair_shift, pair_owners, len(features.sizes))
+                node_inputs = node_inputs * (1 + _conditioning_rows(self, node_scale, owners, len(features.sizes))) + _conditioning_rows(self, node_shift, owners, len(features.sizes))
         if fused_affine:
             from hip_orb.affine_readout import affine_readout
 
@@ -835,3 +835,10 @@ class HIPOrb(nn.Module):
         base, adapter = orbmol_v2(**options)
         base.disable_stress()
         return cls(base, adapter, **kwargs)
+
+
+def _conditioning_rows(head, value, ids, molecule_count):
+    """Use a dense reduction for a single owner; preserve indexed multi-owner calls."""
+    if getattr(head, "single_owner_broadcast", False) and molecule_count == 1:
+        return value.expand(len(ids), -1)
+    return value[ids]

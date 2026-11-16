@@ -188,6 +188,8 @@ def main():
     parser.add_argument("--shared-geometry", action="store_true")
     parser.add_argument("--backbone-layer-mix", type=int, default=0)
     parser.add_argument("--checkpoint-context", action="store_true")
+    parser.add_argument("--single-owner-broadcast", action="store_true",
+                        help="Broadcast affine conditioning in single-molecule head calls")
     parser.add_argument("--readout-conditioning", action="store_true")
     parser.add_argument("--readout-state-mode", choices=("none", "concat", "residual"), default="none")
     parser.add_argument("--pair-state-conditioning", choices=("none", "adapter", "residual"), default="none")
@@ -392,9 +394,11 @@ def main():
                               orb_message_graph=args.orb_message_graph, **weights)
     execution_config = configure_execution(model, args.execution_mode)
     model.head._radial_only_backward = args.radial_only_backward
+    model.head.single_owner_broadcast = args.single_owner_broadcast
     model.head._fused_pair_inputs = args.head_input_fusion in ("pairs", "both")
     model._compact_pair_loss = args.packed_loss_implementation == "pairs"
-    execution_config.update(head_input_fusion=args.head_input_fusion,
+    execution_config.update(single_owner_broadcast=args.single_owner_broadcast,
+                            head_input_fusion=args.head_input_fusion,
                             checkpoint_context=args.checkpoint_context,
                             readout_conditioning=args.readout_conditioning,
                             readout_state_mode=args.readout_state_mode,
