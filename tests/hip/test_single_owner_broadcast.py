@@ -21,7 +21,7 @@ def test_complete_head_updates(sizes, checkpoint):
     candidate = copy.deepcopy(reference)
     candidate.single_owner_broadcast = True
     for h in (reference, candidate):
-        h.checkpoint_pair_activations = checkpoint
+        h.checkpoint_context = checkpoint
     opts = [torch.optim.AdamW(h.parameters(), lr=1e-3) for h in (reference, candidate)]
     assert reference.config == candidate.config
     assert reference.state_dict().keys() == candidate.state_dict().keys()
