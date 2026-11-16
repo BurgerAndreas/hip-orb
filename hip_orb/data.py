@@ -56,6 +56,11 @@ class OrbMolDataset(Dataset):
             raise ValueError("Unknown backend or cache mode")
         if cache_bytes < 0 or max_open < 1:
             raise ValueError("Invalid cache limits")
+        from hip_orb.shard_cache import ShardCache
+
+        self.shard_cache = ShardCache.from_environment()
+        if self.shard_cache is not None and backend != "hdf5":
+            raise ValueError("The bounded shard cache requires HDF5")
         self.backend, self.cache_mode = backend, cache_mode
         self.fields = tuple(key for key in FIELDS if not training_only or key not in ("energy", "forces"))
         self.cache_bytes, self.max_open, self.chunk_cache_bytes = cache_bytes, max_open, chunk_cache_bytes
@@ -86,6 +91,11 @@ class OrbMolDataset(Dataset):
         if shard in self._files:
             self._files.move_to_end(shard)
             return self._files[shard][1]
+        if self.shard_cache is not None:
+            return self.shard_cache.open(self.paths[shard], lambda: self._open_datasets(shard))
+        return self._open_datasets(shard)
+
+    def _open_datasets(self, shard):
         if self.backend == "mmap":
             datasets = {key: np.load(Path(self.paths[shard]) / f"{key}.npy", mmap_mode="r")
                         for key in (*self.fields, "omol_index")}
