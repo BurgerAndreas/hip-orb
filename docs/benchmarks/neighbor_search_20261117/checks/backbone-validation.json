@@ -1,0 +1,19 @@
+{
+  "structure_id": "1AON:10000:403d2a0651b650a3",
+  "natoms": 10000,
+  "geometry_sha256": "403d2a0651b650a38034f6a5b106fc8e895566812d5bb229a403329815fa4f50",
+  "method_version": "78f3679b21f747a536188098ffce288a5e5dc7456b214858abd9ac1975bee657",
+  "checkpoint_sha256": "3dbef70b5fdc9124392181b0d8686c79f1c02bf5fefcb878a4eaa51d03e4f5e8",
+  "mode": "backbone_chunk_validation",
+  "definition": "max absolute difference across every value, bounded minus unbounded",
+  "row_chunk": 65536,
+  "cutoff_angstrom": 30,
+  "nodes_max_abs": 0.00843164324760437,
+  "edges_max_abs": 0.1179819107055664,
+  "charges_max_abs": 0.00023628026247024536,
+  "pairs": 9146502,
+  "blocks_max_abs_eV_per_angstrom2": 0.0006727185100317001,
+  "diagonal_max_abs_eV_per_angstrom2": 0.0007665157318115234,
+  "charges_unit": "elementary charge",
+  "latent_unit": "dimensionless"
+}

@@ -1,0 +1,91 @@
+{
+  "method_version": "7323bc34d5b5c39ddd2e7137b1e4d08971eb72c7f6afadce840e57686ca828aa",
+  "source_sha256": {
+    "neighbor_search.py": "25c6010836c4b3570b0a74446467690fb340ebfbe51712e9d88456d0c77e77d7",
+    "neighbor_kernels.py": "0bdeeaaf5da5c82cc0cbb7d6595de5121d32bb0c03755f88fbd8cdb240288fab",
+    "cutoff_inference.py": "ee85b51ba1ff5f39cdab59a4246b406dbf94e29a4406bbdfc691b0bd3301f8d7",
+    "benchmark_neighbor_search.py": "1afa6d42110bb3ec62cd60f11b18883ac20af6522ae5bd06124cf1f953264b7d"
+  },
+  "backbone_checkpoint_sha256": "3dbef70b5fdc9124392181b0d8686c79f1c02bf5fefcb878a4eaa51d03e4f5e8",
+  "head_config": {
+    "latent_dim": 256,
+    "hidden": 128,
+    "cutoff": 30,
+    "radial_features": "log",
+    "radial_cutoff": 12.0,
+    "radial_bases": 16,
+    "pair_residual_layers": 0,
+    "neighbor_pooling": true
+  },
+  "head_seed": 20261117,
+  "head_weights": "deterministic random initialization; no trained head checkpoint",
+  "torch": "2.8.0+cu128",
+  "python": "3.12.3",
+  "gpu": "NVIDIA L40S",
+  "arguments": {
+    "weights": "../orbmol-v2.ckpt",
+    "input": "../inputs/1AON.pdb",
+    "output": "../results-large-r2",
+    "counts": [
+      10000,
+      30000,
+      100000
+    ],
+    "backends": [
+      "brute",
+      "cpu_async",
+      "gpu"
+    ],
+    "cutoff": 30,
+    "hidden": 128,
+    "pair_chunk": 65536,
+    "warmup": 1,
+    "repeats": 3,
+    "train_max_atoms": 10000,
+    "threads": 4
+  },
+  "timing_boundary": "Measure full cutoff inference and sparse-head training on fixed structures.\n\nThe timed boundary starts with CPU ASE atoms already in memory and includes\nmessage graph construction, transfers, the frozen Orb backbone, radius search,\nand the two-pass Hessian head. Training also includes zero_grad, block MSE,\nbackward, and AdamW. File reads, checkpoint loading, and warmup are excluded.\nTraining targets are zero blocks: this measures execution, not model accuracy.\n",
+  "units": {
+    "seconds": "s",
+    "memory": "bytes",
+    "blocks": "eV/angstrom^2",
+    "loss": "(eV/angstrom^2)^2"
+  },
+  "training_loss": "mean(blocks**2) + mean(diagonal**2); zero target; one forward/backward/AdamW",
+  "training_scope": "cutoff sparse-head path; existing dense runner is unchanged",
+  "input_structures": [
+    {
+      "structure_id": "1AON:10000:403d2a0651b650a3",
+      "path": "/scratch/aburger/hip-neighbor-search-20261117/results-large-r2/inputs/1AON-10000-403d2a0651b6.npz",
+      "natoms": 10000,
+      "geometry_sha256": "403d2a0651b650a38034f6a5b106fc8e895566812d5bb229a403329815fa4f50",
+      "source": "/scratch/aburger/hip-neighbor-search-20261117/inputs/1AON.pdb",
+      "source_sha256": "5cddcf0ebe222238073f73f4fcc0f579a090389f9c3d152399b4e41ca4a0ed3e",
+      "source_url": "https://files.rcsb.org/download/1AON.pdb",
+      "geometry_kind": "prefix",
+      "position_unit": "angstrom"
+    },
+    {
+      "structure_id": "1AON:30000:03edc93031ed2b46",
+      "path": "/scratch/aburger/hip-neighbor-search-20261117/results-large-r2/inputs/1AON-30000-03edc93031ed.npz",
+      "natoms": 30000,
+      "geometry_sha256": "03edc93031ed2b464bbe02819aa7998ca868b3559d5cb996bf3393f2bed3bf0e",
+      "source": "/scratch/aburger/hip-neighbor-search-20261117/inputs/1AON.pdb",
+      "source_sha256": "5cddcf0ebe222238073f73f4fcc0f579a090389f9c3d152399b4e41ca4a0ed3e",
+      "source_url": "https://files.rcsb.org/download/1AON.pdb",
+      "geometry_kind": "prefix",
+      "position_unit": "angstrom"
+    },
+    {
+      "structure_id": "1AON:100000:190ec5786a6a634d",
+      "path": "/scratch/aburger/hip-neighbor-search-20261117/results-large-r2/inputs/1AON-100000-190ec5786a6a.npz",
+      "natoms": 100000,
+      "geometry_sha256": "190ec5786a6a634d20a3499e6f9cb8fdcaa2d58ac17befcde742c542eca41b16",
+      "source": "/scratch/aburger/hip-neighbor-search-20261117/inputs/1AON.pdb",
+      "source_sha256": "5cddcf0ebe222238073f73f4fcc0f579a090389f9c3d152399b4e41ca4a0ed3e",
+      "source_url": "https://files.rcsb.org/download/1AON.pdb",
+      "geometry_kind": "translated-copy scaling proxy",
+      "position_unit": "angstrom"
+    }
+  ]
+}
