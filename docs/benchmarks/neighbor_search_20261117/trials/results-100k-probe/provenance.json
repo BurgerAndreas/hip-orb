@@ -1,0 +1,69 @@
+{
+  "method_version": "1a081bea5d3299673dea0bd4ff55aa6a797adb93e6386736b3ed644aa4dde0c8",
+  "source_sha256": {
+    "neighbor_search.py": "25c6010836c4b3570b0a74446467690fb340ebfbe51712e9d88456d0c77e77d7",
+    "neighbor_kernels.py": "0bdeeaaf5da5c82cc0cbb7d6595de5121d32bb0c03755f88fbd8cdb240288fab",
+    "cutoff_inference.py": "ee85b51ba1ff5f39cdab59a4246b406dbf94e29a4406bbdfc691b0bd3301f8d7",
+    "backbone_chunks.py": "aada1578a8115f36fa49a0c8c28646fb9649648b7e7b517f2399fafd9a533c43",
+    "benchmark_neighbor_search.py": "6ad6c499d89e654e384ebc50e03c450ccf63fedfbf9e7c5140245a01bea75c4f"
+  },
+  "backbone_checkpoint_sha256": "3dbef70b5fdc9124392181b0d8686c79f1c02bf5fefcb878a4eaa51d03e4f5e8",
+  "head_config": {
+    "latent_dim": 256,
+    "hidden": 128,
+    "cutoff": 30,
+    "radial_features": "log",
+    "radial_cutoff": 12.0,
+    "radial_bases": 16,
+    "pair_residual_layers": 0,
+    "neighbor_pooling": true
+  },
+  "head_seed": 20261117,
+  "head_weights": "deterministic random initialization; no trained head checkpoint",
+  "torch": "2.8.0+cu128",
+  "python": "3.12.3",
+  "gpu": "NVIDIA L40S",
+  "arguments": {
+    "weights": "../orbmol-v2.ckpt",
+    "input": "../inputs/1AON.pdb",
+    "output": "../results-100k-probe",
+    "counts": [
+      100000
+    ],
+    "backends": [
+      "brute",
+      "cpu_async",
+      "gpu"
+    ],
+    "cutoff": 30,
+    "hidden": 128,
+    "pair_chunk": 65536,
+    "warmup": 0,
+    "repeats": 1,
+    "train_max_atoms": 0,
+    "threads": 4,
+    "backbone_chunk": 65536
+  },
+  "timing_boundary": "Measure full cutoff inference and sparse-head training on fixed structures.\n\nThe timed boundary starts with CPU ASE atoms already in memory and includes\nmessage graph construction, transfers, the frozen Orb backbone, radius search,\nand the two-pass Hessian head. Training also includes zero_grad, block MSE,\nbackward, and AdamW. File reads, checkpoint loading, and warmup are excluded.\nTraining targets are zero blocks: this measures execution, not model accuracy.\n",
+  "units": {
+    "seconds": "s",
+    "memory": "bytes",
+    "blocks": "eV/angstrom^2",
+    "loss": "(eV/angstrom^2)^2"
+  },
+  "training_loss": "mean(blocks**2) + mean(diagonal**2); zero target; one forward/backward/AdamW",
+  "training_scope": "cutoff sparse-head path; existing dense runner is unchanged",
+  "input_structures": [
+    {
+      "structure_id": "1AON:100000:190ec5786a6a634d",
+      "path": "/scratch/aburger/hip-neighbor-search-20261117/results-100k-probe/inputs/1AON-100000-190ec5786a6a.npz",
+      "natoms": 100000,
+      "geometry_sha256": "190ec5786a6a634d20a3499e6f9cb8fdcaa2d58ac17befcde742c542eca41b16",
+      "source": "/scratch/aburger/hip-neighbor-search-20261117/inputs/1AON.pdb",
+      "source_sha256": "5cddcf0ebe222238073f73f4fcc0f579a090389f9c3d152399b4e41ca4a0ed3e",
+      "source_url": "https://files.rcsb.org/download/1AON.pdb",
+      "geometry_kind": "translated-copy scaling proxy",
+      "position_unit": "angstrom"
+    }
+  ]
+}

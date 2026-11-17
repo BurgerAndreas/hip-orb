@@ -1,0 +1,296 @@
+{
+  "definition": "median of synchronized wall seconds; all raw repeats remain in per_structure.jsonl",
+  "results": [
+    {
+      "structure_id": "1AON:100:42f4f36bc36af6d0",
+      "natoms": 100,
+      "mode": "inference",
+      "pairs": 4950,
+      "timings": {
+        "brute": {
+          "median_seconds": 0.009136125998338684,
+          "min_seconds": 0.009004363004351035,
+          "max_seconds": 0.009710909012937918,
+          "repeats": 5,
+          "peak_allocated_bytes": 155253248
+        },
+        "cpu_async": {
+          "median_seconds": 0.009332262008683756,
+          "min_seconds": 0.009274399984860793,
+          "max_seconds": 0.00953262799885124,
+          "repeats": 5,
+          "peak_allocated_bytes": 155253248
+        },
+        "gpu": {
+          "median_seconds": 0.00967382697854191,
+          "min_seconds": 0.009573835995979607,
+          "max_seconds": 0.009834561991738155,
+          "repeats": 5,
+          "peak_allocated_bytes": 155253248
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:100:42f4f36bc36af6d0",
+      "natoms": 100,
+      "mode": "training",
+      "pairs": 4950,
+      "timings": {
+        "brute": {
+          "median_seconds": 0.0167685330088716,
+          "min_seconds": 0.016300992981996387,
+          "max_seconds": 0.01798587999655865,
+          "repeats": 5,
+          "peak_allocated_bytes": 236030464
+        },
+        "cpu_async": {
+          "median_seconds": 0.017539235996082425,
+          "min_seconds": 0.016959009983111173,
+          "max_seconds": 0.022804907988756895,
+          "repeats": 5,
+          "peak_allocated_bytes": 235472896
+        },
+        "gpu": {
+          "median_seconds": 0.028367035003611818,
+          "min_seconds": 0.027908852003747597,
+          "max_seconds": 0.03260501500335522,
+          "repeats": 5,
+          "peak_allocated_bytes": 235472896
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:350:538b0490882a3490",
+      "natoms": 350,
+      "mode": "inference",
+      "pairs": 46875,
+      "timings": {
+        "brute": {
+          "median_seconds": 0.01396311100688763,
+          "min_seconds": 0.013940165983512998,
+          "max_seconds": 0.014603870979044586,
+          "repeats": 5,
+          "peak_allocated_bytes": 463727104
+        },
+        "cpu_async": {
+          "median_seconds": 0.014262068987591192,
+          "min_seconds": 0.013870663999114186,
+          "max_seconds": 0.014566886005923152,
+          "repeats": 5,
+          "peak_allocated_bytes": 463727104
+        },
+        "gpu": {
+          "median_seconds": 0.014188228989951313,
+          "min_seconds": 0.014170852024108171,
+          "max_seconds": 0.01424812400364317,
+          "repeats": 5,
+          "peak_allocated_bytes": 463727104
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:350:538b0490882a3490",
+      "natoms": 350,
+      "mode": "training",
+      "pairs": 46875,
+      "timings": {
+        "brute": {
+          "median_seconds": 0.030399373994441703,
+          "min_seconds": 0.030115002999082208,
+          "max_seconds": 0.03339602498454042,
+          "repeats": 5,
+          "peak_allocated_bytes": 1122716672
+        },
+        "cpu_async": {
+          "median_seconds": 0.028063326986739412,
+          "min_seconds": 0.02801591402385384,
+          "max_seconds": 0.028336449002381414,
+          "repeats": 5,
+          "peak_allocated_bytes": 1122716672
+        },
+        "gpu": {
+          "median_seconds": 0.03160806497908197,
+          "min_seconds": 0.030497395986458287,
+          "max_seconds": 0.03362026298418641,
+          "repeats": 5,
+          "peak_allocated_bytes": 1122716672
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:1204:fda8f16dcbe7f61d",
+      "natoms": 1204,
+      "mode": "inference",
+      "pairs": 488981,
+      "timings": {
+        "brute": {
+          "median_seconds": 0.1006429810076952,
+          "min_seconds": 0.10058116298750974,
+          "max_seconds": 0.10086210997542366,
+          "repeats": 5,
+          "peak_allocated_bytes": 760673792
+        },
+        "cpu_async": {
+          "median_seconds": 0.09977905100095086,
+          "min_seconds": 0.09960629299166612,
+          "max_seconds": 0.1011790570046287,
+          "repeats": 5,
+          "peak_allocated_bytes": 760673792
+        },
+        "gpu": {
+          "median_seconds": 0.0989954489923548,
+          "min_seconds": 0.0988551140180789,
+          "max_seconds": 0.09978370199678466,
+          "repeats": 5,
+          "peak_allocated_bytes": 760673792
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:1204:fda8f16dcbe7f61d",
+      "natoms": 1204,
+      "mode": "training",
+      "pairs": 488981,
+      "timings": {
+        "brute": {
+          "median_seconds": 0.2296171729976777,
+          "min_seconds": 0.22946877501090057,
+          "max_seconds": 0.22984903000178747,
+          "repeats": 5,
+          "peak_allocated_bytes": 2069206528
+        },
+        "cpu_async": {
+          "median_seconds": 0.22890326401102357,
+          "min_seconds": 0.228725351014873,
+          "max_seconds": 0.2300079150008969,
+          "repeats": 5,
+          "peak_allocated_bytes": 2069206528
+        },
+        "gpu": {
+          "median_seconds": 0.22705401098937728,
+          "min_seconds": 0.2266831120068673,
+          "max_seconds": 0.22727884200867265,
+          "repeats": 5,
+          "peak_allocated_bytes": 2069206528
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:10000:403d2a0651b650a3",
+      "natoms": 10000,
+      "mode": "inference",
+      "pairs": 9146502,
+      "timings": {
+        "brute": {
+          "median_seconds": 1.6395933069870807,
+          "min_seconds": 1.6390081589925103,
+          "max_seconds": 1.641716117010219,
+          "repeats": 5,
+          "peak_allocated_bytes": 3774276608
+        },
+        "cpu_async": {
+          "median_seconds": 1.7034982850018423,
+          "min_seconds": 1.6855638269917108,
+          "max_seconds": 1.749828502011951,
+          "repeats": 5,
+          "peak_allocated_bytes": 3774276608
+        },
+        "gpu": {
+          "median_seconds": 1.5633051879995037,
+          "min_seconds": 1.5626064660027623,
+          "max_seconds": 1.5636268350062892,
+          "repeats": 5,
+          "peak_allocated_bytes": 3774276608
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:10000:403d2a0651b650a3",
+      "natoms": 10000,
+      "mode": "training",
+      "pairs": 9146502,
+      "timings": {
+        "brute": {
+          "median_seconds": 4.254211047984427,
+          "min_seconds": 4.252545831986936,
+          "max_seconds": 4.447689677996095,
+          "repeats": 5,
+          "peak_allocated_bytes": 12745993728
+        },
+        "cpu_async": {
+          "median_seconds": 4.230626428005053,
+          "min_seconds": 4.218341853993479,
+          "max_seconds": 4.450583445024677,
+          "repeats": 5,
+          "peak_allocated_bytes": 12745993728
+        },
+        "gpu": {
+          "median_seconds": 4.107888516999083,
+          "min_seconds": 4.107213818002492,
+          "max_seconds": 4.319854011991993,
+          "repeats": 5,
+          "peak_allocated_bytes": 12745993728
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:30000:03edc93031ed2b46",
+      "natoms": 30000,
+      "mode": "inference",
+      "pairs": 32229619,
+      "timings": {
+        "brute": {
+          "median_seconds": 5.946572735992959,
+          "min_seconds": 5.945753236999735,
+          "max_seconds": 5.9546484439924825,
+          "repeats": 5,
+          "peak_allocated_bytes": 10674913280
+        },
+        "cpu_async": {
+          "median_seconds": 6.406132393982261,
+          "min_seconds": 6.396851022989722,
+          "max_seconds": 6.427583798009437,
+          "repeats": 5,
+          "peak_allocated_bytes": 10674913280
+        },
+        "gpu": {
+          "median_seconds": 5.415374542993959,
+          "min_seconds": 5.411935734009603,
+          "max_seconds": 5.418450953002321,
+          "repeats": 5,
+          "peak_allocated_bytes": 10674913280
+        }
+      }
+    },
+    {
+      "structure_id": "1AON:100000:190ec5786a6a634d",
+      "natoms": 100000,
+      "mode": "inference",
+      "pairs": 116977262,
+      "timings": {
+        "brute": {
+          "median_seconds": 24.729549249983393,
+          "min_seconds": 24.725505441980204,
+          "max_seconds": 24.737223825010005,
+          "repeats": 5,
+          "peak_allocated_bytes": 35390988288
+        },
+        "cpu_async": {
+          "median_seconds": 23.810573402006412,
+          "min_seconds": 23.703211967018433,
+          "max_seconds": 23.876297729002545,
+          "repeats": 5,
+          "peak_allocated_bytes": 35390988288
+        },
+        "gpu": {
+          "median_seconds": 19.393619251000928,
+          "min_seconds": 19.38819885699195,
+          "max_seconds": 19.404879948997404,
+          "repeats": 5,
+          "peak_allocated_bytes": 35390988288
+        }
+      }
+    }
+  ],
+  "errors": []
+}

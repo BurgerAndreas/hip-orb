@@ -1,0 +1,91 @@
+{
+  "method_version": "e55a1bc9a02f81dc2cc2dab423677d3a392aedb98c1e95e9a07668d9116bca69",
+  "source_sha256": {
+    "neighbor_search.py": "25c6010836c4b3570b0a74446467690fb340ebfbe51712e9d88456d0c77e77d7",
+    "neighbor_kernels.py": "0bdeeaaf5da5c82cc0cbb7d6595de5121d32bb0c03755f88fbd8cdb240288fab",
+    "cutoff_inference.py": "ee85b51ba1ff5f39cdab59a4246b406dbf94e29a4406bbdfc691b0bd3301f8d7",
+    "benchmark_neighbor_search.py": "b8281fcc13cd6c48c79b7e8abdeb2ead585c94e14c15cc81541f36dcd6ccb05b"
+  },
+  "backbone_checkpoint_sha256": "3dbef70b5fdc9124392181b0d8686c79f1c02bf5fefcb878a4eaa51d03e4f5e8",
+  "head_config": {
+    "latent_dim": 256,
+    "hidden": 128,
+    "cutoff": 30,
+    "radial_features": "log",
+    "radial_cutoff": 12.0,
+    "radial_bases": 16,
+    "pair_residual_layers": 0,
+    "neighbor_pooling": true
+  },
+  "head_seed": 20261117,
+  "head_weights": "deterministic random initialization; no trained head checkpoint",
+  "torch": "2.8.0+cu128",
+  "python": "3.12.3",
+  "gpu": "NVIDIA L40S",
+  "arguments": {
+    "weights": "../orbmol-v2.ckpt",
+    "input": "../inputs/1AON.pdb",
+    "output": "../results-small",
+    "counts": [
+      100,
+      350,
+      1204
+    ],
+    "backends": [
+      "brute",
+      "cpu_async",
+      "gpu"
+    ],
+    "cutoff": 30,
+    "hidden": 128,
+    "pair_chunk": 65536,
+    "warmup": 1,
+    "repeats": 3,
+    "train_max_atoms": 1204,
+    "threads": 4
+  },
+  "timing_boundary": "Measure full cutoff inference and sparse-head training on fixed structures.\n\nThe timed boundary starts with CPU ASE atoms already in memory and includes\nmessage graph construction, transfers, the frozen Orb backbone, radius search,\nand the two-pass Hessian head. Training also includes zero_grad, block MSE,\nbackward, and AdamW. File reads, checkpoint loading, and warmup are excluded.\nTraining targets are zero blocks: this measures execution, not model accuracy.\n",
+  "units": {
+    "seconds": "s",
+    "memory": "bytes",
+    "blocks": "eV/angstrom^2",
+    "loss": "(eV/angstrom^2)^2"
+  },
+  "training_loss": "mean(blocks**2) + mean(diagonal**2); zero target; one forward/backward/AdamW",
+  "training_scope": "cutoff sparse-head path; existing dense runner is unchanged",
+  "input_structures": [
+    {
+      "structure_id": "1AON:100:42f4f36bc36af6d0",
+      "path": "/scratch/aburger/hip-neighbor-search-20261117/results-small/inputs/1AON-100-42f4f36bc36a.npz",
+      "natoms": 100,
+      "geometry_sha256": "42f4f36bc36af6d0b51e1c7698b3d30e958460e24889700013ca7934ae6aed93",
+      "source": "/scratch/aburger/hip-neighbor-search-20261117/inputs/1AON.pdb",
+      "source_sha256": "5cddcf0ebe222238073f73f4fcc0f579a090389f9c3d152399b4e41ca4a0ed3e",
+      "source_url": "https://files.rcsb.org/download/1AON.pdb",
+      "geometry_kind": "prefix",
+      "position_unit": "angstrom"
+    },
+    {
+      "structure_id": "1AON:350:538b0490882a3490",
+      "path": "/scratch/aburger/hip-neighbor-search-20261117/results-small/inputs/1AON-350-538b0490882a.npz",
+      "natoms": 350,
+      "geometry_sha256": "538b0490882a34908d4bb3580f1f5fc8dfea618fdf2d5b1d9b1d8c2a859116ce",
+      "source": "/scratch/aburger/hip-neighbor-search-20261117/inputs/1AON.pdb",
+      "source_sha256": "5cddcf0ebe222238073f73f4fcc0f579a090389f9c3d152399b4e41ca4a0ed3e",
+      "source_url": "https://files.rcsb.org/download/1AON.pdb",
+      "geometry_kind": "prefix",
+      "position_unit": "angstrom"
+    },
+    {
+      "structure_id": "1AON:1204:fda8f16dcbe7f61d",
+      "path": "/scratch/aburger/hip-neighbor-search-20261117/results-small/inputs/1AON-1204-fda8f16dcbe7.npz",
+      "natoms": 1204,
+      "geometry_sha256": "fda8f16dcbe7f61d6688cbab88dc28ee68aefff551b485f2b383d1f0c29fefcb",
+      "source": "/scratch/aburger/hip-neighbor-search-20261117/inputs/1AON.pdb",
+      "source_sha256": "5cddcf0ebe222238073f73f4fcc0f579a090389f9c3d152399b4e41ca4a0ed3e",
+      "source_url": "https://files.rcsb.org/download/1AON.pdb",
+      "geometry_kind": "prefix",
+      "position_unit": "angstrom"
+    }
+  ]
+}
