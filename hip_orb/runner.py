@@ -25,6 +25,7 @@ from hip_orb.packed_training import collate_packed_compact, packed_update
 from hip_orb.preparation import prepare_batch
 from hip_orb.schedules import learning_rate
 from hip_orb.session_stop import UpdateBoundary
+from hip_orb.packed_consistency import packed_consistency_update
 
 
 def timed_batches(loader, timing):
@@ -147,6 +148,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--weights-path", type=Path)
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--checkpoint-every", type=int, default=1000)
+    parser.add_argument("--lr-start-step", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--max-hessian-elements", type=int, default=4_000_000)
     parser.add_argument("--batching", choices=("equal", "balanced"), default="equal")
@@ -265,9 +268,10 @@ def main():
         parser.error("A loss multiplier requires balanced packed training")
     if args.batching == "balanced" and (
             args.loss_type not in ("block_rmse", "mse", "mae", "mass_weighted_block_rmse")
-            or args.translation_scale or args.consistency_weight
-            or args.reference_views != 1 or args.rotation_sampling != "uniform"):
-        parser.error("Balanced packed training requires one uniform view, no shifts or consistency, and a supported packed loss")
+            or args.translation_scale
+            or (args.reference_views == 2 and args.loss_type != "block_rmse")
+            or args.reference_views not in (1, 2) or args.rotation_sampling != "uniform"):
+        parser.error("Balanced training requires uniform rotations, no shifts, and block_rmse for two views")
     if args.precision_policy != "float32" and (args.batching != "balanced" or not args.device.startswith("cuda")):
         parser.error("Mixed precision requires balanced packed training on CUDA")
     if args.precision_overrides is None:
@@ -305,11 +309,13 @@ def main():
     if not math.isfinite(args.lr) or args.lr <= 0:
         parser.error("Learning rate must be positive and finite")
     try:
-        learning_rate(1, args.lr, args.lr_schedule, args.max_steps, args.warmup_fraction)
+        learning_rate(args.lr_start_step + 1, args.lr, args.lr_schedule, args.max_steps, args.warmup_fraction, args.lr_start_step)
     except ValueError as error:
         parser.error(str(error))
     schedule_config = {"schedule": args.lr_schedule, "peak_lr": args.lr,
                        "total_steps": args.max_steps, "warmup_fraction": args.warmup_fraction}
+    if args.lr_start_step:
+        schedule_config["start_step"] = args.lr_start_step
     if args.loss_type not in LOSS_TYPES:
         parser.error(f"Hessian loss must be one of {LOSS_TYPES}")
     loss_key = f"train_{args.loss_type}"
@@ -570,16 +576,18 @@ def main():
                 if limit_reached():
                     break
                 update_lr = learning_rate(global_step + 1, args.lr, args.lr_schedule,
-                                          args.max_steps, args.warmup_fraction)
+                                          args.max_steps, args.warmup_fraction, args.lr_start_step)
                 for group in optimizer.param_groups:
                     group["lr"] = update_lr
                 update_started = time.perf_counter()
                 scale_before = None if scaler is None else scaler.get_scale()
                 if args.batching == "balanced":
                     try:
-                        loss, size = packed_update(model, optimizer, batch, args.device,
+                        update = packed_consistency_update if args.reference_views == 2 else packed_update
+                        extra = ({"consistency_weight": args.consistency_weight, "consistency_seed": args.seed + 1_000_003 + global_step} if args.reference_views == 2 else {})
+                        loss, size = update(model, optimizer, batch, args.device,
                                                    args.seed + epoch, loss_type=args.loss_type, scaler=scaler,
-                                                   loss_scale=args.loss_scale)
+                                                   loss_scale=args.loss_scale, **extra)
                     except FloatingPointError:
                         save_checkpoint()
                         torch.save({"batch": batch, "seed": args.seed + epoch,
@@ -605,6 +613,8 @@ def main():
                                       "grad_scale": scaler.get_scale(), "skipped_updates": skipped_updates}), flush=True)
                     continue
                 global_step += 1
+                if args.checkpoint_every > 0 and global_step % args.checkpoint_every == 0:
+                    save_checkpoint()
                 check_limits()
                 # Keep bounded diagnostics, not a list proportional to a long run.
                 if len(training_batch_sizes) < 1024:

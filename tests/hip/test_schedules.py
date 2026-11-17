@@ -61,3 +61,9 @@ def test_step_limited_sessions_resume_optimizer_schedule(monkeypatch, tmp_path):
         assert report['training_complete'] == (step == 5)
     assert validations == [2, 4, 5]
     assert rates == [learning_rate(s, .001, 'cosine', 5, .2) for s in range(1, 6)]
+
+
+def test_finetuning_schedule_preserves_source_checkpoint_lr():
+    assert learning_rate(2783119, 1e-4, "cosine", 3000000, .15, 2000000) == pytest.approx(1.5221749183457917e-5, rel=1e-12)
+    assert learning_rate(2150000, 1e-4, "cosine", 3000000, .15, 2000000) == 1e-4
+    assert learning_rate(3000000, 1e-4, "cosine", 3000000, .15, 2000000) == 0

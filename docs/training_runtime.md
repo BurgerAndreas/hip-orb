@@ -20,3 +20,24 @@ For a two-GPU smoke test, run `tests/hip/check_training_runtime_gpu.py` with
 parameters and Adam states on each GPU, then checks NCCL stop consensus. Run the
 cache and checkpoint tests separately with pytest. These are correctness checks;
 they do not measure end-to-end training throughput or production resume.
+
+## Two-view distributed continuation
+
+Use `torchrun --standalone --nproc_per_node=2 -m hip_orb.distributed_train`
+with the normal runner arguments. This entrypoint supports float32 packed
+`block_rmse` with two reference views. It shards each global batch by molecule,
+retains full-batch rotation seeds, sums molecule-weighted gradients, clips once,
+and advances identical AdamW states. Global continuation limits are 64 molecules
+and 1,792 atoms. Rank zero owns the primary output; other ranks use private outputs.
+Use `--lr-start-step 2000000` to preserve the source fine-tuning cosine schedule.
+The source checkpoint's batch plan fingerprint and cursor must match; do not
+reset them when moving shard paths. Real-data two-rank validation is required
+before production use.
+
+For real-data validation, replace the entrypoint with
+`tests/hip/check_distributed_continuation.py`. On the first batch it compares
+a two-molecule single-GPU update against the distributed update, including
+loss, gradients, parameters and Adam state, then restores the source state
+before the requested continuation. Run a short session and verify both rank
+checkpoints have identical tensors, optimizer state, step and cursor.
+Periodic checkpoints default to every 1,000 updates (`--checkpoint-every`).
