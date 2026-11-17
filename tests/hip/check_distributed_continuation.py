@@ -29,4 +29,5 @@ def verify(model,optimizer,batch,*args,**kwargs):
   dt._completed_updates=0
  return original(model,optimizer,batch,*args,**kwargs)
 dt._distributed_consistency_update=verify
-dt.main()
+if __name__ == "__main__":
+ dt.main()
