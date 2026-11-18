@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import time
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
@@ -232,6 +233,10 @@ def main():
     parser.add_argument("--head-input-fusion", choices=("none", "cast", "pairs", "both"), default="none")
     parser.add_argument("--fused-optimizer", action="store_true")
     parser.add_argument("--precision-policy", choices=("float32", "fp16-message-head"), default="float32")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Require deterministic PyTorch algorithms and configure cuBLAS workspace")
+    parser.add_argument("--float32-matmul-precision", choices=("high", "highest"), default="high",
+                        help="Use highest for full float32 matrix products; high permits TF32 on NVIDIA")
     parser.add_argument("--precision-overrides", type=json.loads, default=None,
                         help="Map linear layer patterns to targeted LinearPolicy settings")
     parser.add_argument("--seed", type=int, default=7)
@@ -378,11 +383,15 @@ def main():
         train_options = {"batch_sampler": sampler, "collate_fn": collate_packed_compact}
         batching_config.update(settings=sampler.settings, fingerprint=sampler.fingerprint,
                                batches_per_epoch=len(sampler))
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(args.deterministic)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.set_num_threads(2)
     weights = {} if args.weights_path is None else {"weights_path": args.weights_path}
-    model = HIPOrb.pretrained(args.device, hidden=args.hidden, cutoff=args.hessian_cutoff,
+    model = HIPOrb.pretrained(args.device, precision=f"float32-{args.float32_matmul_precision}",
+                              hidden=args.hidden, cutoff=args.hessian_cutoff,
                               radial_features=args.radial_features,
                               radial_cutoff=args.radial_cutoff,
                               radial_bases=args.radial_bases,
@@ -406,7 +415,9 @@ def main():
     model.head.single_owner_broadcast = args.single_owner_broadcast
     model.head._fused_pair_inputs = args.head_input_fusion in ("pairs", "both")
     model._compact_pair_loss = args.packed_loss_implementation == "pairs"
-    execution_config.update(single_owner_broadcast=args.single_owner_broadcast,
+    execution_config.update(deterministic=args.deterministic,
+                            float32_matmul_precision=args.float32_matmul_precision,
+                            single_owner_broadcast=args.single_owner_broadcast,
                             head_input_fusion=args.head_input_fusion,
                             checkpoint_context=args.checkpoint_context,
                             readout_conditioning=args.readout_conditioning,
@@ -620,7 +631,7 @@ def main():
                 if len(training_batch_sizes) < 1024:
                     training_batch_sizes.append(size)
                 now = elapsed()
-                if global_step == 1 or global_step % 1000 == 0:
+                if global_step - session_start_step in (1, 10, 100) or global_step % 1000 == 0:
                     # Include CUDA completion waits and loop work outside packed_update.
                     measured_s = max(time.perf_counter() - window_started, 1e-12)
                     print(json.dumps({"global_step": global_step, "elapsed_s": now,

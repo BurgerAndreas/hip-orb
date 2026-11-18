@@ -30,6 +30,13 @@ retains full-batch rotation seeds, sums molecule-weighted gradients, clips once,
 and advances identical AdamW states. Global continuation limits are 64 molecules
 and 1,792 atoms. Rank zero owns the primary output; other ranks use private outputs.
 Use `--lr-start-step 2000000` to preserve the source fine-tuning cosine schedule.
+On NVIDIA, use `--float32-matmul-precision highest --deterministic` for this
+continuation. The pretrained default `high` permits TF32, which produced about
+20% relative gradient error between packed and per-molecule execution on L40S.
+Full float32 with deterministic kernels reduced the measured relative error to
+about 0.0053%; the fused and PyTorch loss paths agreed. The entrypoint configures
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA initialization. Precision and
+determinism are recorded in execution metadata. Validation tolerances are unchanged.
 The source checkpoint's batch plan fingerprint and cursor must match; do not
 reset them when moving shard paths. Real-data two-rank validation is required
 before production use.

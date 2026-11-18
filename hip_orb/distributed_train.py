@@ -187,6 +187,8 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size < 2:
         raise RuntimeError(f"Expected at least two GPU ranks, got WORLD_SIZE={world_size}")
+    # Set before CUDA context/handle creation; runner can enable deterministic kernels.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl")
     # Keep nonzero ranks' runner bookkeeping and reports isolated from the

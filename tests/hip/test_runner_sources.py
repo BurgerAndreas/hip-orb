@@ -58,7 +58,15 @@ def test_timed_run_stops_updates_and_always_validates(monkeypatch, tmp_path, ses
         def train(self):
             pass
 
-    monkeypatch.setattr(runner.HIPOrb, "pretrained", lambda *a, **k: Model())
+    requested_precisions = []
+    deterministic_settings = []
+    monkeypatch.setattr(runner.torch, "use_deterministic_algorithms", deterministic_settings.append)
+
+    def pretrained(*args, **kwargs):
+        requested_precisions.append(kwargs["precision"])
+        return Model()
+
+    monkeypatch.setattr(runner.HIPOrb, "pretrained", pretrained)
     monkeypatch.setattr(runner, "configure_execution", lambda model, mode: {"mode": mode})
     loader_settings = []
 
@@ -91,7 +99,7 @@ def test_timed_run_stops_updates_and_always_validates(monkeypatch, tmp_path, ses
     monkeypatch.setattr(runner, "validate", validate)
     argv = ["train", "--train-index", str(training),
         "--validation-index", str(validation), "--output", str(tmp_path / "out"),
-        "--device", "cpu", "--max-duration-seconds", "20" if session_duration == 10 else "10",
+        "--device", "cpu", "--float32-matmul-precision", "highest", "--deterministic", "--max-duration-seconds", "20" if session_duration == 10 else "10",
         "--validation-every-seconds", "5", "--validation-batch-size", "256",
         "--validation-samples", "10000", "--loss-type", loss_type]
     if session_duration:
@@ -112,6 +120,10 @@ def test_timed_run_stops_updates_and_always_validates(monkeypatch, tmp_path, ses
                                  else [12] if session_duration else [8, 13])
     assert report["final_validation_completed"]
     assert report["checkpoint_readable"]
+    assert set(requested_precisions) == {"float32-highest"}
+    assert set(deterministic_settings) == {True}
+    assert report["execution_config"]["deterministic"]
+    assert report["execution_config"]["float32_matmul_precision"] == "highest"
     assert report["loss_type"] == loss_type
     assert f"train_{loss_type}" in report
     saved = torch.load(tmp_path / "out/head.pt", weights_only=True)
