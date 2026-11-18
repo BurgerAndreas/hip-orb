@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import time
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
@@ -24,6 +25,8 @@ from hip_orb.model import HIPOrb
 from hip_orb.packed_training import collate_packed_compact, packed_update
 from hip_orb.preparation import prepare_batch
 from hip_orb.schedules import learning_rate
+from hip_orb.session_stop import UpdateBoundary
+from hip_orb.packed_consistency import packed_consistency_update
 
 
 def timed_batches(loader, timing):
@@ -146,6 +149,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--weights-path", type=Path)
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--checkpoint-every", type=int, default=1000)
+    parser.add_argument("--lr-start-step", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--max-hessian-elements", type=int, default=4_000_000)
     parser.add_argument("--batching", choices=("equal", "balanced"), default="equal")
@@ -163,6 +168,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--session-steps", type=int)
+    parser.add_argument("--stop-request-file", type=Path,
+                        help="Save and stop at an update boundary when this file exists; remove before resume")
     parser.add_argument("--max-duration-seconds", type=float,
                         help="Stop updates after this elapsed time, including periodic validation")
     parser.add_argument("--session-duration-seconds", type=float,
@@ -188,6 +195,10 @@ def main():
     parser.add_argument("--shared-geometry", action="store_true")
     parser.add_argument("--backbone-layer-mix", type=int, default=0)
     parser.add_argument("--checkpoint-context", action="store_true")
+    parser.add_argument("--single-owner-broadcast", action="store_true",
+                        help="Broadcast affine conditioning in single-molecule head calls")
+    parser.add_argument("--distributed-microbatch-pair-limit", type=int, default=0,
+                        help="Limit sum of squared atom counts per rank microbatch. Zero uses one molecule at a time.")
     parser.add_argument("--readout-conditioning", action="store_true")
     parser.add_argument("--readout-state-mode", choices=("none", "concat", "residual"), default="none")
     parser.add_argument("--pair-state-conditioning", choices=("none", "adapter", "residual"), default="none")
@@ -224,6 +235,10 @@ def main():
     parser.add_argument("--head-input-fusion", choices=("none", "cast", "pairs", "both"), default="none")
     parser.add_argument("--fused-optimizer", action="store_true")
     parser.add_argument("--precision-policy", choices=("float32", "fp16-message-head"), default="float32")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Require deterministic PyTorch algorithms and configure cuBLAS workspace")
+    parser.add_argument("--float32-matmul-precision", choices=("high", "highest"), default="high",
+                        help="Use highest for full float32 matrix products; high permits TF32 on NVIDIA")
     parser.add_argument("--precision-overrides", type=json.loads, default=None,
                         help="Map linear layer patterns to targeted LinearPolicy settings")
     parser.add_argument("--seed", type=int, default=7)
@@ -252,6 +267,12 @@ def main():
         args.reference_views = 2 if args.consistency_weight else 1
     if args.reference_views not in (1, 2) or (args.consistency_weight and args.reference_views != 2):
         parser.error("Consistency requires two reference views; views must be 1 or 2")
+    pair_limit = args.distributed_microbatch_pair_limit
+    if type(pair_limit) is not int or pair_limit < 0:
+        parser.error("Distributed microbatch pair limit must be a nonnegative integer")
+    if pair_limit and (not torch.distributed.is_initialized() or args.batching != "balanced"
+                       or args.reference_views != 2):
+        parser.error("Distributed microbatches require distributed balanced training with two reference views")
     if args.batching not in ("equal", "balanced"):
         parser.error("Batching must be equal or balanced")
     if not math.isfinite(args.loss_scale) or args.loss_scale <= 0:
@@ -260,9 +281,10 @@ def main():
         parser.error("A loss multiplier requires balanced packed training")
     if args.batching == "balanced" and (
             args.loss_type not in ("block_rmse", "mse", "mae", "mass_weighted_block_rmse")
-            or args.translation_scale or args.consistency_weight
-            or args.reference_views != 1 or args.rotation_sampling != "uniform"):
-        parser.error("Balanced packed training requires one uniform view, no shifts or consistency, and a supported packed loss")
+            or args.translation_scale
+            or (args.reference_views == 2 and args.loss_type != "block_rmse")
+            or args.reference_views not in (1, 2) or args.rotation_sampling != "uniform"):
+        parser.error("Balanced training requires uniform rotations, no shifts, and block_rmse for two views")
     if args.precision_policy != "float32" and (args.batching != "balanced" or not args.device.startswith("cuda")):
         parser.error("Mixed precision requires balanced packed training on CUDA")
     if args.precision_overrides is None:
@@ -300,11 +322,13 @@ def main():
     if not math.isfinite(args.lr) or args.lr <= 0:
         parser.error("Learning rate must be positive and finite")
     try:
-        learning_rate(1, args.lr, args.lr_schedule, args.max_steps, args.warmup_fraction)
+        learning_rate(args.lr_start_step + 1, args.lr, args.lr_schedule, args.max_steps, args.warmup_fraction, args.lr_start_step)
     except ValueError as error:
         parser.error(str(error))
     schedule_config = {"schedule": args.lr_schedule, "peak_lr": args.lr,
                        "total_steps": args.max_steps, "warmup_fraction": args.warmup_fraction}
+    if args.lr_start_step:
+        schedule_config["start_step"] = args.lr_start_step
     if args.loss_type not in LOSS_TYPES:
         parser.error(f"Hessian loss must be one of {LOSS_TYPES}")
     loss_key = f"train_{args.loss_type}"
@@ -367,11 +391,15 @@ def main():
         train_options = {"batch_sampler": sampler, "collate_fn": collate_packed_compact}
         batching_config.update(settings=sampler.settings, fingerprint=sampler.fingerprint,
                                batches_per_epoch=len(sampler))
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(args.deterministic)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.set_num_threads(2)
     weights = {} if args.weights_path is None else {"weights_path": args.weights_path}
-    model = HIPOrb.pretrained(args.device, hidden=args.hidden, cutoff=args.hessian_cutoff,
+    model = HIPOrb.pretrained(args.device, precision=f"float32-{args.float32_matmul_precision}",
+                              hidden=args.hidden, cutoff=args.hessian_cutoff,
                               radial_features=args.radial_features,
                               radial_cutoff=args.radial_cutoff,
                               radial_bases=args.radial_bases,
@@ -392,9 +420,14 @@ def main():
                               orb_message_graph=args.orb_message_graph, **weights)
     execution_config = configure_execution(model, args.execution_mode)
     model.head._radial_only_backward = args.radial_only_backward
+    model.head.single_owner_broadcast = args.single_owner_broadcast
+    model._distributed_microbatch_pair_limit = pair_limit
     model.head._fused_pair_inputs = args.head_input_fusion in ("pairs", "both")
     model._compact_pair_loss = args.packed_loss_implementation == "pairs"
-    execution_config.update(head_input_fusion=args.head_input_fusion,
+    execution_config.update(deterministic=args.deterministic,
+                            float32_matmul_precision=args.float32_matmul_precision,
+                            single_owner_broadcast=args.single_owner_broadcast,
+                            head_input_fusion=args.head_input_fusion,
                             checkpoint_context=args.checkpoint_context,
                             readout_conditioning=args.readout_conditioning,
                             readout_state_mode=args.readout_state_mode,
@@ -408,6 +441,8 @@ def main():
                                     "cache_mib": args.loader_cache_mib, "open_files": args.loader_open_files,
                                     "cache_mode": args.loader_cache_mode,
                                     "validation_cache_mode": args.validation_cache_mode})
+    if pair_limit:
+        execution_config["distributed_microbatch_pair_limit"] = pair_limit
     optimizer = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=0,
                                   fused=args.fused_optimizer)
     scaler = None
@@ -457,6 +492,12 @@ def main():
             for group in saved["optimizer"]["param_groups"]:
                 group.update(fused=args.fused_optimizer, foreach=None)
             optimizer.load_state_dict(saved["optimizer"])
+        if saved.get("seed", args.seed) != args.seed:
+            raise ValueError("Checkpoint training seed differs")
+        if "torch_rng_state" in saved:
+            torch.set_rng_state(saved["torch_rng_state"].cpu())
+        if saved.get("cuda_rng_state") is not None and args.device.startswith("cuda"):
+            torch.cuda.set_rng_state(saved["cuda_rng_state"].cpu(), device=args.device)
         global_step = saved.get("global_step", 0)
         previous_elapsed = saved.get("training_elapsed_s", 0.0)
         last_validation_elapsed = saved.get("last_validation_elapsed_s", 0.0)
@@ -478,29 +519,40 @@ def main():
     started = time.perf_counter()
     current_epoch = resume_epoch
     session_start_step = global_step
+    stop_boundary = UpdateBoundary(args.stop_request_file)
 
     def elapsed():
         return previous_elapsed + time.perf_counter() - started
 
+    def check_limits():
+        total = ((args.max_steps is not None and global_step >= args.max_steps)
+                 or (args.max_duration_seconds is not None
+                     and elapsed() >= args.max_duration_seconds))
+        session = ((args.session_steps is not None
+                    and global_step - session_start_step >= args.session_steps)
+                   or (args.session_duration_seconds is not None
+                       and time.perf_counter() - started >= args.session_duration_seconds))
+        # Collectives occur only at matching update/loop boundaries. Repeated
+        # bookkeeping queries below read this agreed decision without collectives.
+        stop_boundary.reached(session, total_limit=total)
+
     def total_limit_reached():
-        return ((args.max_steps is not None and global_step >= args.max_steps)
-                or (args.max_duration_seconds is not None
-                    and elapsed() >= args.max_duration_seconds))
+        return stop_boundary.total_limited
 
     def limit_reached():
-        return (total_limit_reached() or (args.session_steps is not None
-                and global_step - session_start_step >= args.session_steps)
-                or (args.session_duration_seconds is not None
-                and time.perf_counter() - started >= args.session_duration_seconds))
+        return stop_boundary.stopped
 
     def save_checkpoint():
-        checkpoint = {"head": model.head.state_dict(), "head_config": model.head.config,
+        checkpoint = {"seed": args.seed, "torch_rng_state": torch.get_rng_state(),
+                      "cuda_rng_state": torch.cuda.get_rng_state(args.device) if args.device.startswith("cuda") else None,
+                      "head": model.head.state_dict(), "head_config": model.head.config,
                       "regularization_config": regularization_config,
                       "batching_config": batching_config,
                       "augmentation_config": augmentation_config,
                       "optimizer": optimizer.state_dict(), "global_step": global_step,
                       "orb_commit": ORB_COMMIT, "orb_version": ORB_VERSION,
-                      "precision": "float32-high" if scaler is None else "mixed-fp16-fp32",
+                      "precision": (f"float32-{args.float32_matmul_precision}" if scaler is None
+                                    else "mixed-fp16-fp32"),
                       "precision_policy": args.precision_policy,
                       "grad_scaler": None if scaler is None else scaler.state_dict(),
                       "skipped_updates": skipped_updates,
@@ -543,19 +595,22 @@ def main():
             timing = {"loader_s": 0.0, "update_s": 0.0, "samples": 0, "updates": 0}
             window_started = time.perf_counter()
             for batch in timed_batches(train_loader, timing):
+                check_limits()
                 if limit_reached():
                     break
                 update_lr = learning_rate(global_step + 1, args.lr, args.lr_schedule,
-                                          args.max_steps, args.warmup_fraction)
+                                          args.max_steps, args.warmup_fraction, args.lr_start_step)
                 for group in optimizer.param_groups:
                     group["lr"] = update_lr
                 update_started = time.perf_counter()
                 scale_before = None if scaler is None else scaler.get_scale()
                 if args.batching == "balanced":
                     try:
-                        loss, size = packed_update(model, optimizer, batch, args.device,
+                        update = packed_consistency_update if args.reference_views == 2 else packed_update
+                        extra = ({"consistency_weight": args.consistency_weight, "consistency_seed": args.seed + 1_000_003 + global_step} if args.reference_views == 2 else {})
+                        loss, size = update(model, optimizer, batch, args.device,
                                                    args.seed + epoch, loss_type=args.loss_type, scaler=scaler,
-                                                   loss_scale=args.loss_scale)
+                                                   loss_scale=args.loss_scale, **extra)
                     except FloatingPointError:
                         save_checkpoint()
                         torch.save({"batch": batch, "seed": args.seed + epoch,
@@ -581,11 +636,14 @@ def main():
                                       "grad_scale": scaler.get_scale(), "skipped_updates": skipped_updates}), flush=True)
                     continue
                 global_step += 1
+                if args.checkpoint_every > 0 and global_step % args.checkpoint_every == 0:
+                    save_checkpoint()
+                check_limits()
                 # Keep bounded diagnostics, not a list proportional to a long run.
                 if len(training_batch_sizes) < 1024:
                     training_batch_sizes.append(size)
                 now = elapsed()
-                if global_step == 1 or global_step % 1000 == 0:
+                if global_step - session_start_step in (1, 10, 100) or global_step % 1000 == 0:
                     # Include CUDA completion waits and loop work outside packed_update.
                     measured_s = max(time.perf_counter() - window_started, 1e-12)
                     print(json.dumps({"global_step": global_step, "elapsed_s": now,
@@ -596,7 +654,7 @@ def main():
                                       "window_mean_batch_size": timing["samples"] / timing["updates"]}), flush=True)
                     timing.update(loader_s=0.0, update_s=0.0, samples=0, updates=0)
                     window_started = time.perf_counter()
-                if not total_limit_reached() and (not limit_reached() or args.session_steps is not None) and (
+                if not total_limit_reached() and (not limit_reached() or (args.session_steps is not None and not stop_boundary.requested)) and (
                     (args.validation_every and global_step % args.validation_every == 0)
                     or (args.validation_every_seconds
                         and now - last_validation_elapsed >= args.validation_every_seconds)
@@ -621,8 +679,9 @@ def main():
                 break
             current_epoch, epoch_batches = epoch + 1, 0
         # Always exercise final validation, even if a periodic check just ran.
+        check_limits()
         training_elapsed_s = elapsed()
-        session_paused = limit_reached() and not total_limit_reached()
+        session_paused = limit_reached() and (stop_boundary.requested or not total_limit_reached())
         save_checkpoint()
         final = ({"validation": {}, "validation_samples": 0} if session_paused else
                  validate(model, validation_loader, args.device, args.report_samples))
@@ -654,11 +713,15 @@ def main():
                   "frozen_state_unchanged": unchanged, "separate_validation_set": True,
                   "final_validation_completed": not session_paused,
                   "training_complete": not session_paused,
+                  "stop_reason": "requested" if stop_boundary.requested else ("session_limit" if session_paused else "complete"),
+                  "auto_continue": session_paused and not stop_boundary.requested,
                   "checkpoint_readable": bool(saved["head"]),
                   "orb_commit": ORB_COMMIT, "elapsed_s": elapsed(),
                   "peak_allocated_bytes": torch.cuda.max_memory_allocated()
                   if args.device.startswith("cuda") else None}
-        (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        report_temporary = args.output / "report.tmp.json"
+        report_temporary.write_text(json.dumps(report, indent=2) + "\n")
+        report_temporary.replace(args.output / "report.json")
         print(json.dumps({key: report[key] for key in ("global_step", "validation", "validation_samples",
                          "final_validation_completed", "checkpoint_readable")}), flush=True)
     finally:

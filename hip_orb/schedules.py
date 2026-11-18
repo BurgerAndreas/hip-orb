@@ -2,11 +2,13 @@
 import math
 
 
-def learning_rate(step, peak_lr, schedule="constant", total_steps=None, warmup_fraction=0.15):
+def learning_rate(step, peak_lr, schedule="constant", total_steps=None, warmup_fraction=0.15, start_step=0):
     if schedule == "constant":
         return peak_lr
     if schedule != "cosine" or not total_steps or not 0 < warmup_fraction < 1:
         raise ValueError("Cosine schedule requires total steps and a warmup fraction between zero and one")
+    step -= start_step
+    total_steps -= start_step
     warmup = max(1, round(total_steps * warmup_fraction))
     if not 1 <= step <= total_steps or warmup >= total_steps:
         raise ValueError("Invalid schedule step or warmup length")

@@ -40,6 +40,9 @@ fi
 if [[ -n "${HIP_SESSION_SECONDS:-}" ]]; then
   hip_train_args+=(--session-duration-seconds "$HIP_SESSION_SECONDS")
 fi
+if [[ -n "${HIP_STOP_REQUEST_FILE:-}" ]]; then
+  hip_train_args+=(--stop-request-file "$HIP_STOP_REQUEST_FILE")
+fi
 if [[ -n "${HIP_TRAIN_EXECUTION_MODE:-}" ]]; then
   hip_train_args+=(--execution-mode "$HIP_TRAIN_EXECUTION_MODE")
 fi
