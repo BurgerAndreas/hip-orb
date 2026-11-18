@@ -1,4 +1,4 @@
-"""Multi-GPU data-parallel continuation for the CSLab MI100 node.
+"""Multi-GPU data-parallel continuation for packed molecular training.
 
 Each existing packed batch is split by molecule across ranks. The ranks reduce
 the batch-weighted gradients before one synchronized optimizer step, so each
@@ -8,6 +8,7 @@ saved step consumes exactly one entry from the original batch plan.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -42,6 +43,21 @@ def _slice_batch(batch, selected):
         for i in selected
     ], dim=0)
     return result
+
+
+def _microbatches(selected, sizes, pair_limit):
+    """Keep rank order and bound each group's quadratic activation footprint."""
+    group = []
+    pair_work = 0
+    for molecule in selected:
+        cost = sizes[molecule] ** 2
+        if group and pair_work + cost > pair_limit:
+            yield group
+            group, pair_work = [], 0
+        group.append(molecule)
+        pair_work += cost
+    if group:
+        yield group
 
 
 def _distributed_consistency_update(
@@ -97,12 +113,12 @@ def _distributed_consistency_update(
         # receives the same deterministic views it would have received on one GPU.
         first_all = prepare_packed(batch, seed)
         second_all = prepare_packed(batch, consistency_seed)
-        # MI100 has 32 GiB per device. A full local half-batch can exceed that
-        # for packed Hessian views, so accumulate each molecule's contribution
-        # serially while preserving one global-batch optimizer update.
-        for molecule in selected:
-            first_batch = _slice_batch(first_all, [molecule])
-            second_batch = _slice_batch(second_all, [molecule])
+        # The default retains the serial memory footprint. Oversize molecules
+        # always run alone. All groups contribute to the same optimizer update.
+        pair_limit = getattr(model, "_distributed_microbatch_pair_limit", 0)
+        for group in _microbatches(selected, sizes_all, pair_limit):
+            first_batch = _slice_batch(first_all, group)
+            second_batch = _slice_batch(second_all, group)
             indices = compact_indices(tuple(first_batch["sizes"].tolist()), str(device))
             upper = first_batch["hessian_upper"].to(device, non_blocking=True)
             graph = packed_graph(first_batch, model.adapter, device)
@@ -122,23 +138,23 @@ def _distributed_consistency_update(
             r2 = second_batch["rotation"].to(device, non_blocking=True)
             if fused_loss and first.is_cuda:
                 from hip_orb.consistency_kernels import two_view_block_loss
-                molecule_loss = two_view_block_loss(
+                group_loss = two_view_block_loss(
                     first, first_diag, second, second_diag, upper, r1, r2,
                     indices, consistency_weight,
                 )
             else:
-                molecule_loss = 0.5 * (
+                group_loss = 0.5 * (
                     compact_loss(first, first_diag, upper, r1, indices)
                     + compact_loss(second, second_diag, upper, r2, indices)
                 )
-                molecule_loss = molecule_loss + consistency_weight * _reference_consistency_terms(
+                group_loss = group_loss + consistency_weight * _reference_consistency_terms(
                     first, first_diag, second, second_diag, r2 @ r1.T, indices
                 )
-            molecule_loss = molecule_loss * (loss_scale / total)
-            if not torch.isfinite(molecule_loss):
-                raise FloatingPointError("Distributed packed consistency loss is not finite")
-            local_loss = local_loss + molecule_loss.detach()
-            molecule_loss.backward()
+            # Compact loss averages the group's molecules. Recover their share
+            # of the global mean before accumulating gradients on each rank.
+            group_loss = group_loss * (loss_scale * len(group) / total)
+            local_loss = local_loss + group_loss.detach()
+            group_loss.backward()
 
     # The loss is a mean over local molecules; weighted local means sum to the
     # original global-batch mean.  One packed all-reduce synchronizes every head
@@ -151,17 +167,19 @@ def _distributed_consistency_update(
         for p in parameters
     ])
     dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_loss, op=dist.ReduceOp.SUM)
+    loss_value = float(local_loss)
+    if not math.isfinite(loss_value):
+        raise FloatingPointError("Distributed packed consistency loss is not finite")
     offset = 0
-    for i, parameter in enumerate(parameters):
+    for parameter, has_grad in zip(parameters, active.tolist(), strict=True):
         count = parameter.numel()
         parameter.grad = (flat[offset:offset + count].view_as(parameter)
-                          if active[i].item() else None)
+                          if has_grad else None)
         offset += count
     torch.nn.utils.clip_grad_norm_(parameters, 10.0, error_if_nonfinite=True)
     optimizer.step()
 
-    loss_value = local_loss.detach().clone()
-    dist.all_reduce(loss_value, op=dist.ReduceOp.SUM)
     global _completed_updates
     _completed_updates += 1
     if rank == 0 and (_completed_updates == 1 or _completed_updates % _update_log_interval == 0):
@@ -172,7 +190,7 @@ def _distributed_consistency_update(
                           "estimated_rank_pair_cost": rank_costs}), flush=True)
     from hip_orb.mixed_precision import invalidate_trainable_precision_caches
     invalidate_trainable_precision_caches(model)
-    return float(loss_value), total
+    return loss_value, total
 
 
 def distributed_limit_reached(local):

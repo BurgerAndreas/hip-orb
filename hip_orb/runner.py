@@ -197,6 +197,8 @@ def main():
     parser.add_argument("--checkpoint-context", action="store_true")
     parser.add_argument("--single-owner-broadcast", action="store_true",
                         help="Broadcast affine conditioning in single-molecule head calls")
+    parser.add_argument("--distributed-microbatch-pair-limit", type=int, default=0,
+                        help="Limit sum of squared atom counts per rank microbatch. Zero uses one molecule at a time.")
     parser.add_argument("--readout-conditioning", action="store_true")
     parser.add_argument("--readout-state-mode", choices=("none", "concat", "residual"), default="none")
     parser.add_argument("--pair-state-conditioning", choices=("none", "adapter", "residual"), default="none")
@@ -265,6 +267,12 @@ def main():
         args.reference_views = 2 if args.consistency_weight else 1
     if args.reference_views not in (1, 2) or (args.consistency_weight and args.reference_views != 2):
         parser.error("Consistency requires two reference views; views must be 1 or 2")
+    pair_limit = args.distributed_microbatch_pair_limit
+    if type(pair_limit) is not int or pair_limit < 0:
+        parser.error("Distributed microbatch pair limit must be a nonnegative integer")
+    if pair_limit and (not torch.distributed.is_initialized() or args.batching != "balanced"
+                       or args.reference_views != 2):
+        parser.error("Distributed microbatches require distributed balanced training with two reference views")
     if args.batching not in ("equal", "balanced"):
         parser.error("Batching must be equal or balanced")
     if not math.isfinite(args.loss_scale) or args.loss_scale <= 0:
@@ -413,6 +421,7 @@ def main():
     execution_config = configure_execution(model, args.execution_mode)
     model.head._radial_only_backward = args.radial_only_backward
     model.head.single_owner_broadcast = args.single_owner_broadcast
+    model._distributed_microbatch_pair_limit = pair_limit
     model.head._fused_pair_inputs = args.head_input_fusion in ("pairs", "both")
     model._compact_pair_loss = args.packed_loss_implementation == "pairs"
     execution_config.update(deterministic=args.deterministic,
@@ -432,6 +441,8 @@ def main():
                                     "cache_mib": args.loader_cache_mib, "open_files": args.loader_open_files,
                                     "cache_mode": args.loader_cache_mode,
                                     "validation_cache_mode": args.validation_cache_mode})
+    if pair_limit:
+        execution_config["distributed_microbatch_pair_limit"] = pair_limit
     optimizer = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=0,
                                   fused=args.fused_optimizer)
     scaler = None
@@ -540,7 +551,8 @@ def main():
                       "augmentation_config": augmentation_config,
                       "optimizer": optimizer.state_dict(), "global_step": global_step,
                       "orb_commit": ORB_COMMIT, "orb_version": ORB_VERSION,
-                      "precision": "float32-high" if scaler is None else "mixed-fp16-fp32",
+                      "precision": (f"float32-{args.float32_matmul_precision}" if scaler is None
+                                    else "mixed-fp16-fp32"),
                       "precision_policy": args.precision_policy,
                       "grad_scaler": None if scaler is None else scaler.state_dict(),
                       "skipped_updates": skipped_updates,
