@@ -6,7 +6,7 @@ from types import MethodType
 
 import torch
 
-EXECUTION_MODES = ("eager", "optimized")
+EXECUTION_MODES = ("eager", "eager-metadata", "optimized")
 
 
 def edge_values(edges, ids):
@@ -83,6 +83,8 @@ def configure_execution(
     keep native FP32 forward operations and use FP16 only in backward products.
     Selected frozen backbone MLPs use FP16. Norms and losses keep float32.
     Reconfiguration restores the original methods before applying a new mode.
+    The eager-metadata path uses known graph sizes and dense edge indexing with
+    the eager path's precision and kernels.
     """
     if mode not in EXECUTION_MODES:
         raise ValueError(f"Execution mode must be one of {EXECUTION_MODES}")
@@ -137,9 +139,11 @@ def configure_execution(
     if hasattr(head, "orb_feature_adapter"):
         head.orb_feature_adapter._edge_checkpoint_limit = 0
     model._dense_message_kernels = False
-    model._tensor_graph = model._async_metadata = False
-    model._dense_indexing = mode != "eager"
-    if mode != "eager":
+    optimized = mode == "optimized"
+    known_metadata = mode != "eager"
+    model._tensor_graph = False
+    model._async_metadata = model._dense_indexing = known_metadata
+    if optimized:
         if cuda_float32 and aligned_inputs:
             from hip_orb.aligned_linear import aligned_linear
 
@@ -160,7 +164,7 @@ def configure_execution(
         head._edge_gather = edge_values
         head.pair_inputs = joined_pair_inputs
         model._tensor_graph = cuda_float32
-        model._async_metadata = True
+    if known_metadata:
         if "conditioner" in originals:
             from hip_orb.compilation import shape_known_conditioning
 
@@ -173,14 +177,14 @@ def configure_execution(
             if isinstance(module, LatentChargeHead):
                 module.forward = MethodType(known_charge_forward, module)
     fast = bool(
-        mode != "eager"
+        optimized
         and cuda_float32
         and speed_features
         and find_spec("triton") is not None
         and not hasattr(head, "backbone_mixture")
     )
     mixture_backward = bool(
-        mode != "eager"
+        optimized
         and cuda_float32
         and speed_features
         and backward_fp16
@@ -192,7 +196,7 @@ def configure_execution(
         and (head.shared_geometry if backward_input_fp32 is None else backward_input_fp32)
     )
     project_shared = bool(
-        mode != "eager"
+        optimized
         and cuda_float32
         and speed_features
         and shared_projection
@@ -272,18 +276,18 @@ def configure_execution(
         "mode": mode,
         "backbone_precision": precision,
         "head_precision": precision,
-        "tensor_training": mode != "eager",
+        "tensor_training": optimized,
         "tensor_molecular_graph": bool(model._tensor_graph),
         "masked_edge_kernel": bool(
-            mode != "eager" and cuda_float32 and find_spec("triton") is not None
+            optimized and cuda_float32 and find_spec("triton") is not None
         ),
-        "known_metadata": mode != "eager",
+        "known_metadata": known_metadata,
     }
     result["fused_rms_norm"] = bool(
-        mode != "eager" and cuda_float32 and fused_norm and find_spec("triton") is not None
+        optimized and cuda_float32 and fused_norm and find_spec("triton") is not None
     )
     result["dense_indexing"] = model._dense_indexing
-    result["aligned_fp32_inputs"] = bool(mode != "eager" and cuda_float32 and aligned_inputs)
+    result["aligned_fp32_inputs"] = bool(optimized and cuda_float32 and aligned_inputs)
     result.update(
         fused_fp32_silu=fast,
         fused_dense_pair_inputs=fast,
