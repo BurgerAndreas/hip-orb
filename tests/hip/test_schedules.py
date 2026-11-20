@@ -38,7 +38,7 @@ def test_step_limited_sessions_resume_optimizer_schedule(monkeypatch, tmp_path):
         def __iter__(self):
             return iter([{'coords': [0]}] * 20)
     monkeypatch.setattr(runner.HIPOrb, 'pretrained', lambda *a, **k: Model())
-    monkeypatch.setattr(runner, 'configure_execution', lambda model, mode: {'mode': mode})
+    monkeypatch.setattr(runner, 'configure_execution', lambda model, mode, **kwargs: {'mode': mode})
     monkeypatch.setattr(runner, 'make_loader', lambda *a, **k: Loader())
     rates, validations = [], []
     def update(model, optimizer, *args, **kwargs):

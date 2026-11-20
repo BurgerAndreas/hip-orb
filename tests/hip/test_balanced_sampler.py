@@ -165,7 +165,7 @@ def test_runner_uses_packed_updates_and_resumes(monkeypatch, tmp_path, hessian_b
             pass
 
     monkeypatch.setattr(runner.HIPOrb, "pretrained", lambda *a, **k: Model())
-    monkeypatch.setattr(runner, "configure_execution", lambda *a: {})
+    monkeypatch.setattr(runner, "configure_execution", lambda *a, **k: {})
     settings_seen = []
 
     class Loader:

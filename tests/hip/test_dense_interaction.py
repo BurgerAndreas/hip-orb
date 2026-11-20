@@ -4,6 +4,30 @@ import torch
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize("strided_input", ["nodes", "edges", "senders", "receivers"])
+def test_dense_interaction_falls_back_for_strided_inputs(strided_input):
+    from hip_orb.dense_interaction import dense_interaction
+
+    class EagerLayer:
+        _attention_gate = "sigmoid"
+        _node_cond = _edge_cond = None
+
+        def __call__(self, nodes, edges, senders, receivers, cutoff, *, cond_nodes, cond_edges):
+            return nodes, edges
+
+    inputs = {
+        "nodes": torch.randn(3, 4, device="cuda"),
+        "edges": torch.randn(6, 4, device="cuda"),
+        "senders": torch.tensor([0, 0, 1, 1, 2, 2], device="cuda"),
+        "receivers": torch.tensor([1, 2, 0, 2, 0, 1], device="cuda"),
+    }
+    inputs[strided_input] = inputs[strided_input].repeat_interleave(2, dim=0)[::2]
+    assert not inputs[strided_input].is_contiguous()
+    cutoff = torch.ones((6, 1), device="cuda")
+    nodes, edges = dense_interaction(EagerLayer(), *inputs.values(), cutoff, sizes=(3,))
+    assert nodes is inputs["nodes"] and edges is inputs["edges"]
+
+
 @pytest.mark.parametrize("sizes", [(1,), (3, 2, 1), (37, 8)])
 @pytest.mark.parametrize("d", [4, 256])
 def test_dense_message_pack_and_pool_gradients(sizes, d):

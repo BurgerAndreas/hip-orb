@@ -229,6 +229,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--execution-mode", choices=EXECUTION_MODES, default="optimized",
                         help="Use verified selective-precision kernels or the eager reference implementation")
+    parser.add_argument("--dense-orb-rounds", action="store_true",
+                        help="Use FP32 Triton kernels for all dense Orb rounds in eager-metadata or optimized training")
     parser.add_argument("--packed-loss-implementation", choices=("dense", "pairs"), default="dense")
     parser.add_argument("--linear-input-alignment", type=int, choices=(1, 8, 16, 32, 64), default=1)
     parser.add_argument("--radial-only-backward", action="store_true")
@@ -418,7 +420,7 @@ def main():
                               pair_state_conditioning=args.pair_state_conditioning,
                               nonlinear_pair_readout=args.nonlinear_pair_readout,
                               orb_message_graph=args.orb_message_graph, **weights)
-    execution_config = configure_execution(model, args.execution_mode)
+    execution_config = configure_execution(model, args.execution_mode, dense_orb_rounds=args.dense_orb_rounds)
     model.head._radial_only_backward = args.radial_only_backward
     model.head.single_owner_broadcast = args.single_owner_broadcast
     model._distributed_microbatch_pair_limit = pair_limit

@@ -67,7 +67,10 @@ def test_timed_run_stops_updates_and_always_validates(monkeypatch, tmp_path, ses
         return Model()
 
     monkeypatch.setattr(runner.HIPOrb, "pretrained", pretrained)
-    monkeypatch.setattr(runner, "configure_execution", lambda model, mode: {"mode": mode})
+    def configure_execution(model, mode, *, dense_orb_rounds):
+        return {"mode": mode, "dense_orb_rounds": dense_orb_rounds}
+
+    monkeypatch.setattr(runner, "configure_execution", configure_execution)
     loader_settings = []
 
     class Loader:
@@ -104,6 +107,12 @@ def test_timed_run_stops_updates_and_always_validates(monkeypatch, tmp_path, ses
         "--validation-samples", "10000", "--loss-type", loss_type]
     if session_duration:
         argv += ["--session-duration-seconds", str(session_duration)]
+    if session_duration == 6:
+        argv += ["--dense-orb-rounds"]
+    elif session_duration == 10:
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"dense_orb_rounds": True}))
+        argv += ["--config", str(config)]
     monkeypatch.setattr(sys, "argv", argv)
     runner.main()
     if session_duration:
@@ -124,6 +133,7 @@ def test_timed_run_stops_updates_and_always_validates(monkeypatch, tmp_path, ses
     assert set(deterministic_settings) == {True}
     assert report["execution_config"]["deterministic"]
     assert report["execution_config"]["float32_matmul_precision"] == "highest"
+    assert report["execution_config"]["dense_orb_rounds"] is (session_duration is not None)
     assert report["loss_type"] == loss_type
     assert f"train_{loss_type}" in report
     saved = torch.load(tmp_path / "out/head.pt", weights_only=True)
@@ -192,7 +202,7 @@ def test_nonfinite_packed_loss_saves_resumable_state_and_batch(monkeypatch, tmp_
         raise FloatingPointError('Packed training loss is not finite')
 
     monkeypatch.setattr(runner.HIPOrb, 'pretrained', lambda *a, **k: Model())
-    monkeypatch.setattr(runner, 'configure_execution', lambda *a: {})
+    monkeypatch.setattr(runner, 'configure_execution', lambda *a, **k: {})
     monkeypatch.setattr(runner, 'BalancedBatchSampler', Sampler)
     monkeypatch.setattr(runner, 'make_loader', lambda *a, **k: Loader())
     monkeypatch.setattr(runner, 'packed_update', fail)
@@ -244,7 +254,7 @@ def test_throughput_includes_work_outside_update(monkeypatch, tmp_path, capsys):
         return 1.0
 
     monkeypatch.setattr(runner.HIPOrb, 'pretrained', lambda *a, **k: Model())
-    monkeypatch.setattr(runner, 'configure_execution', lambda *a: {})
+    monkeypatch.setattr(runner, 'configure_execution', lambda *a, **k: {})
     monkeypatch.setattr(runner, 'make_loader', lambda *a, **k: Loader())
     monkeypatch.setattr(runner, 'prepare_batch', lambda batch, **k: batch)
     monkeypatch.setattr(runner, 'training_step', step)

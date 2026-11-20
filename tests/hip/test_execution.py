@@ -50,9 +50,10 @@ def test_execution_preserves_parameters_checkpoint_outputs_and_gradients(radial)
     torch.testing.assert_close(torch.stack(model.head(f)), expected, atol=0, rtol=0)
     configure_execution(model)
     torch.testing.assert_close(model.head(f, as_tensor=True), expected, atol=0, rtol=0)
-    metadata = configure_execution(model, "eager-metadata")
+    metadata = configure_execution(model, "eager-metadata", dense_orb_rounds=True)
     assert metadata["known_metadata"] and metadata["dense_indexing"]
     assert not metadata["tensor_training"] and not metadata["masked_edge_kernel"]
+    assert not metadata["dense_orb_rounds"]
     assert metadata["head_precision"] == metadata["backbone_precision"] == "float64"
     torch.testing.assert_close(torch.stack(model.head(f)), expected, atol=0, rtol=0)
     eager = configure_execution(model, "eager")

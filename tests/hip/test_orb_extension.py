@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from hip_orb.execution import configure_execution
 from hip_orb.model import Features, HessianHead, HIPOrb
 from hip_orb.orb_extension import make_orb_processor, dense_message_topology
 from hip_orb.graphs import hessian_pair_topology
@@ -75,6 +76,55 @@ def base_and_graph():
         edge_features={"vectors":positions[r]-positions[s], "latent":torch.randn(4,4)},
         senders=s, receivers=r, n_node=torch.tensor([3,2]), n_edge=torch.tensor([2,2]))
     return base, graph
+
+
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")),
+])
+def test_opt_in_dense_orb_rounds_preserve_eager_features_and_gradients(device, monkeypatch):
+    base, graph = base_and_graph()
+    model = HIPOrb(base, None, hidden=8, radial_features="bessel", all_to_all=True,
+                   extra_orb_round=True, orb_message_graph="hessian", orb_rounds=2).to(device)
+    for key in ("node_features", "edge_features", "system_features"):
+        setattr(graph, key, {name: value.to(device) for name, value in getattr(graph, key).items()})
+    graph.senders, graph.receivers = graph.senders.to(device), graph.receivers.to(device)
+    watched = []
+    if device == "cuda":
+        pytest.importorskip("triton")
+        from hip_orb import dense_interaction
+
+        original = dense_interaction.dense_interaction
+
+        def record(layer, *args, **kwargs):
+            watched.append(layer)
+            return original(layer, *args, **kwargs)
+
+        monkeypatch.setattr(dense_interaction, "dense_interaction", record)
+
+    def features_and_gradients():
+        features = model.features(graph, sizes=graph.n_node)
+        loss = features.nodes.square().mean() + features.edges.square().mean()
+        params = [*model.head.orb_message_layer.parameters(), *model.head.extra_orb_layers.parameters()]
+        return (features.nodes, features.edges), torch.autograd.grad(loss, params)
+
+    model.train()
+    configure_execution(model, "eager-metadata")
+    eager, eager_grads = features_and_gradients()
+    settings = configure_execution(model, "eager-metadata", dense_orb_rounds=True)
+    assert settings["dense_orb_rounds"] == (device == "cuda")
+    actual, grads = features_and_gradients()
+    processors = [model.head.orb_message_layer, *model.head.extra_orb_layers]
+    assert watched == (processors if device == "cuda" else [])
+    torch.testing.assert_close(actual, eager, atol=3e-5, rtol=3e-4)
+    torch.testing.assert_close(grads, eager_grads, atol=3e-5, rtol=3e-4)
+
+    watched.clear()
+    model.eval()
+    actual, _ = features_and_gradients()
+    assert not watched
+    torch.testing.assert_close(actual, eager, atol=0, rtol=0)
+    assert not configure_execution(model, "eager-metadata")["dense_orb_rounds"]
 
 
 @pytest.mark.parametrize("message_graph", ["backbone", "hessian"])
