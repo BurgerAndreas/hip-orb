@@ -238,10 +238,15 @@ def pooled_messages(edges, sa, ra, s, r, sizes):
 def dense_interaction(
     layer, nodes, edges, s, r, cutoff, *, cond_nodes=None, cond_edges=None, sizes
 ):
+    # The Triton kernels address each input as contiguous storage.
     if (
         not nodes.is_cuda
         or nodes.dtype != torch.float32
         or edges.dtype != torch.float32
+        or not nodes.is_contiguous()
+        or not edges.is_contiguous()
+        or not s.is_contiguous()
+        or not r.is_contiguous()
         or layer._attention_gate != "sigmoid"
         or layer._node_cond == "concatenative"
         or layer._edge_cond == "concatenative"

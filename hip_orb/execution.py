@@ -75,6 +75,7 @@ def configure_execution(
     fused_affine=True,
     fused_state_inputs=True,
     fused_mlp_activations=True,
+    dense_orb_rounds=False,
 ):
     """Select execution without changing parameters, graph rules, or checkpoints.
 
@@ -84,7 +85,9 @@ def configure_execution(
     Selected frozen backbone MLPs use FP16. Norms and losses keep float32.
     Reconfiguration restores the original methods before applying a new mode.
     The eager-metadata path uses known graph sizes and dense edge indexing with
-    the eager path's precision and kernels.
+    the eager path's precision and kernels. The dense_orb_rounds option enables
+    FP32 Triton kernels for all trainable rounds on dense Hessian graphs in
+    eager-metadata and optimized training.
     """
     if mode not in EXECUTION_MODES:
         raise ValueError(f"Execution mode must be one of {EXECUTION_MODES}")
@@ -141,6 +144,13 @@ def configure_execution(
     model._dense_message_kernels = False
     optimized = mode == "optimized"
     known_metadata = mode != "eager"
+    model._dense_orb_rounds = bool(
+        dense_orb_rounds
+        and known_metadata
+        and cuda_float32
+        and hasattr(head, "orb_distance_encoder")
+        and find_spec("triton") is not None
+    )
     model._tensor_graph = False
     model._async_metadata = model._dense_indexing = known_metadata
     if optimized:
@@ -298,7 +308,8 @@ def configure_execution(
         compact_saved_activations=bool(fast and compact_activations),
         compact_mlp_kernels=bool(fast and compact_activations and scaled_gradients),
         fp16_min_rows=16384 if fast and scaled_gradients else None,
-        dense_message_kernels=fast,
+        dense_message_kernels=fast or model._dense_orb_rounds,
+        dense_orb_rounds=model._dense_orb_rounds,
         precision_guard=("fp32-mixture-forward" if hasattr(head, "backbone_mixture") else None),
     )
     if frozen_half:

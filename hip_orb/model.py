@@ -779,18 +779,21 @@ class HIPOrb(nn.Module):
                 nodes, edges = self.head.orb_feature_adapter(
                     nodes, edges, graph.node_features["atomic_numbers"], charges,
                     graph.node_features["positions"].detach(), senders, receivers)
-            if getattr(self, "_dense_message_kernels", False) and dense_graph is not None:
+            dense_rounds = self.training and getattr(self, "_dense_orb_rounds", False)
+            dense_first = getattr(self, "_dense_message_kernels", False)
+            use_dense = dense_graph is not None and (dense_rounds or dense_first)
+            if use_dense:
                 from hip_orb.dense_interaction import dense_interaction
-                nodes, edges = dense_interaction(
-                    self.head.orb_message_layer, nodes, edges, senders, receivers, message_cutoff,
-                    cond_nodes=cond_nodes, cond_edges=cond_edges, sizes=tuple(shape.tolist()))
-            else:
-                nodes, edges = self.head.orb_message_layer(
-                    nodes, edges, senders, receivers, message_cutoff,
-                    cond_nodes=cond_nodes, cond_edges=cond_edges)
-            for processor in getattr(self.head, "extra_orb_layers", ()):
-                nodes, edges = processor(nodes, edges, senders, receivers, message_cutoff,
-                                         cond_nodes=cond_nodes, cond_edges=cond_edges)
+
+                dense_sizes = tuple(shape.tolist())
+            processors = (self.head.orb_message_layer, *getattr(self.head, "extra_orb_layers", ()))
+            for index, processor in enumerate(processors):
+                args = (nodes, edges, senders, receivers, message_cutoff)
+                if use_dense and (dense_rounds or index == 0):
+                    nodes, edges = dense_interaction(processor, *args, cond_nodes=cond_nodes,
+                                                     cond_edges=cond_edges, sizes=dense_sizes)
+                else:
+                    nodes, edges = processor(*args, cond_nodes=cond_nodes, cond_edges=cond_edges)
         dimension = self.head.config["latent_dim"]
         if out["node_features"].shape[-1] != dimension or out["edge_features"].shape[-1] != dimension:
             raise ValueError("Orb output feature dimensions differ from the Hessian head")
